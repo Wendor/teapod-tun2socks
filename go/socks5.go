@@ -1,0 +1,302 @@
+package tun2socks
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+)
+
+// SOCKS5Client implements a minimal SOCKS5 client (CONNECT and UDP ASSOCIATE).
+type SOCKS5Client struct {
+	host     string
+	port     int
+	username string
+	password string
+}
+
+// NewSOCKS5Client creates a new SOCKS5 client.
+func NewSOCKS5Client(host string, port int, username, password string) *SOCKS5Client {
+	return &SOCKS5Client{host: host, port: port, username: username, password: password}
+}
+
+// DialTCP connects to the SOCKS5 proxy and issues a CONNECT command.
+// Returns the established proxy connection ready for use.
+func (s *SOCKS5Client) DialTCP(dstIP string, dstPort int) (net.Conn, error) {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", s.host, s.port))
+	if err != nil {
+		return nil, fmt.Errorf("socks5: dial proxy: %w", err)
+	}
+
+	if err := s.handshake(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: handshake: %w", err)
+	}
+
+	if err := s.sendConnect(conn, dstIP, dstPort); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: CONNECT: %w", err)
+	}
+
+	return conn, nil
+}
+
+// UDPAssociation holds an active SOCKS5 UDP ASSOCIATE session.
+// The caller must call Close when done — this closes the control TCP connection,
+// which signals the proxy to release the relay (RFC 1928 §7).
+type UDPAssociation struct {
+	// RelayAddr is the proxy UDP relay address to send datagrams to.
+	RelayAddr *net.UDPAddr
+	// ctrl is the TCP control connection that must stay open for the relay lifetime.
+	ctrl net.Conn
+}
+
+// Close releases the UDP association by closing the TCP control connection.
+func (a *UDPAssociation) Close() error { return a.ctrl.Close() }
+
+// UDPAssociate sends a UDP ASSOCIATE command to the SOCKS5 proxy.
+// The returned UDPAssociation.RelayAddr is where datagrams should be sent.
+// The TCP control connection is kept open inside the UDPAssociation — call Close()
+// when the UDP session is done (RFC 1928 §7).
+func (s *SOCKS5Client) UDPAssociate() (*UDPAssociation, error) {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", s.host, s.port))
+	if err != nil {
+		return nil, fmt.Errorf("socks5: dial proxy for UDP ASSOCIATE: %w", err)
+	}
+
+	if err := s.handshake(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: handshake for UDP: %w", err)
+	}
+
+	// Send UDP ASSOCIATE with zeroed client address (proxy decides relay addr).
+	req := []byte{
+		0x05, 0x03, 0x00, // VER=5, CMD=UDP ASSOCIATE, RSV
+		0x01,             // ATYP: IPv4
+		0, 0, 0, 0,       // BND.ADDR: 0.0.0.0 (client doesn't specify)
+		0, 0,             // BND.PORT: 0
+	}
+	if _, err := conn.Write(req); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: write UDP ASSOCIATE req: %w", err)
+	}
+
+	relayAddr, err := readSocksAddress(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: UDP ASSOCIATE response: %w", err)
+	}
+
+	udpAddr, err := net.ResolveUDPAddr("udp", relayAddr)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: resolve relay addr %q: %w", relayAddr, err)
+	}
+
+	return &UDPAssociation{RelayAddr: udpAddr, ctrl: conn}, nil
+}
+
+// EncodeUDPDatagram wraps payload in a SOCKS5 UDP datagram header (RFC 1928 §7).
+//
+//	+----+------+------+----------+----------+----------+
+//	|RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+//	+----+------+------+----------+----------+----------+
+func EncodeUDPDatagram(dstIP net.IP, dstPort int, payload []byte) []byte {
+	var atyp byte
+	var addr []byte
+	if v4 := dstIP.To4(); v4 != nil {
+		atyp = 0x01
+		addr = v4
+	} else {
+		atyp = 0x04
+		addr = dstIP.To16()
+	}
+
+	hdr := make([]byte, 4+len(addr)+2)
+	hdr[0] = 0x00 // RSV
+	hdr[1] = 0x00 // RSV
+	hdr[2] = 0x00 // FRAG = 0 (no fragmentation)
+	hdr[3] = atyp
+	copy(hdr[4:], addr)
+	binary.BigEndian.PutUint16(hdr[4+len(addr):], uint16(dstPort))
+	return append(hdr, payload...)
+}
+
+// DecodeUDPDatagram parses a SOCKS5 UDP datagram, returning the origin address and payload.
+func DecodeUDPDatagram(data []byte) (srcIP net.IP, srcPort int, payload []byte, err error) {
+	if len(data) < 4 {
+		return nil, 0, nil, fmt.Errorf("socks5 UDP: datagram too short")
+	}
+	if data[2] != 0x00 {
+		return nil, 0, nil, fmt.Errorf("socks5 UDP: fragmented datagrams not supported (FRAG=%d)", data[2])
+	}
+
+	atyp := data[3]
+	switch atyp {
+	case 0x01: // IPv4
+		if len(data) < 4+4+2 {
+			return nil, 0, nil, fmt.Errorf("socks5 UDP: IPv4 datagram too short")
+		}
+		srcIP = net.IP(data[4:8])
+		srcPort = int(binary.BigEndian.Uint16(data[8:10]))
+		payload = data[10:]
+	case 0x04: // IPv6
+		if len(data) < 4+16+2 {
+			return nil, 0, nil, fmt.Errorf("socks5 UDP: IPv6 datagram too short")
+		}
+		srcIP = net.IP(data[4:20])
+		srcPort = int(binary.BigEndian.Uint16(data[20:22]))
+		payload = data[22:]
+	default:
+		return nil, 0, nil, fmt.Errorf("socks5 UDP: unsupported ATYP 0x%02x", atyp)
+	}
+	return srcIP, srcPort, payload, nil
+}
+
+// --- internal helpers ---
+
+// handshake performs SOCKS5 method selection and optional username/password auth.
+func (s *SOCKS5Client) handshake(conn net.Conn) error {
+	// Method selection
+	var methods []byte
+	if s.username != "" {
+		methods = []byte{0x05, 0x02, 0x00, 0x02} // NO AUTH + USERNAME/PASSWORD
+	} else {
+		methods = []byte{0x05, 0x01, 0x00} // NO AUTH only
+	}
+	if _, err := conn.Write(methods); err != nil {
+		return fmt.Errorf("write method selection: %w", err)
+	}
+
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return fmt.Errorf("read method response: %w", err)
+	}
+	if resp[0] != 0x05 {
+		return fmt.Errorf("unexpected SOCKS version 0x%02x", resp[0])
+	}
+
+	switch resp[1] {
+	case 0x00:
+		return nil // no auth required
+	case 0x02:
+		return s.authUserPass(conn)
+	case 0xFF:
+		return fmt.Errorf("proxy rejected all auth methods")
+	default:
+		return fmt.Errorf("unsupported auth method 0x%02x", resp[1])
+	}
+}
+
+// authUserPass performs RFC 1929 username/password sub-negotiation.
+func (s *SOCKS5Client) authUserPass(conn net.Conn) error {
+	user := []byte(s.username)
+	pass := []byte(s.password)
+
+	buf := make([]byte, 0, 3+len(user)+len(pass))
+	buf = append(buf, 0x01)
+	buf = append(buf, byte(len(user)))
+	buf = append(buf, user...)
+	buf = append(buf, byte(len(pass)))
+	buf = append(buf, pass...)
+
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("write auth: %w", err)
+	}
+
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return fmt.Errorf("read auth response: %w", err)
+	}
+	if resp[0] != 0x01 { // RFC 1929: sub-negotiation version must be 0x01
+		return fmt.Errorf("unexpected auth sub-negotiation version 0x%02x", resp[0])
+	}
+	if resp[1] != 0x00 {
+		return fmt.Errorf("authentication failed (status=0x%02x)", resp[1])
+	}
+	return nil
+}
+
+// sendConnect sends a SOCKS5 CONNECT command and reads the response.
+func (s *SOCKS5Client) sendConnect(conn net.Conn, dstIP string, dstPort int) error {
+	ip := net.ParseIP(dstIP)
+	if ip == nil {
+		return fmt.Errorf("invalid destination IP: %s", dstIP)
+	}
+
+	var atyp byte
+	var addr []byte
+	if v4 := ip.To4(); v4 != nil {
+		atyp = 0x01
+		addr = v4
+	} else {
+		atyp = 0x04
+		addr = ip.To16()
+	}
+
+	req := make([]byte, 0, 6+len(addr))
+	req = append(req, 0x05, 0x01, 0x00, atyp)
+	req = append(req, addr...)
+	req = append(req, byte(dstPort>>8), byte(dstPort))
+
+	if _, err := conn.Write(req); err != nil {
+		return fmt.Errorf("write CONNECT request: %w", err)
+	}
+
+	// Read and discard the bind address — we don't need it for CONNECT.
+	if _, err := readSocksAddress(conn); err != nil {
+		return fmt.Errorf("read CONNECT response: %w", err)
+	}
+	return nil
+}
+
+// readSocksAddress reads a SOCKS5 reply header (VER REP RSV ATYP BND.ADDR BND.PORT)
+// and returns the bound address as "host:port". Validates VER and REP fields.
+func readSocksAddress(conn net.Conn) (string, error) {
+	hdr := make([]byte, 4)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return "", fmt.Errorf("read reply header: %w", err)
+	}
+	if hdr[0] != 0x05 {
+		return "", fmt.Errorf("unexpected SOCKS version in reply: 0x%02x", hdr[0])
+	}
+	if hdr[1] != 0x00 {
+		return "", fmt.Errorf("SOCKS5 error reply 0x%02x", hdr[1])
+	}
+
+	atyp := hdr[3]
+	var host string
+	switch atyp {
+	case 0x01: // IPv4
+		addr := make([]byte, 4)
+		if _, err := io.ReadFull(conn, addr); err != nil {
+			return "", fmt.Errorf("read IPv4 bind addr: %w", err)
+		}
+		host = net.IP(addr).String()
+	case 0x04: // IPv6
+		addr := make([]byte, 16)
+		if _, err := io.ReadFull(conn, addr); err != nil {
+			return "", fmt.Errorf("read IPv6 bind addr: %w", err)
+		}
+		host = net.IP(addr).String()
+	case 0x03: // domain name
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return "", fmt.Errorf("read domain length: %w", err)
+		}
+		name := make([]byte, lenBuf[0])
+		if _, err := io.ReadFull(conn, name); err != nil {
+			return "", fmt.Errorf("read domain: %w", err)
+		}
+		host = string(name)
+	default:
+		return "", fmt.Errorf("unsupported bind address type 0x%02x", atyp)
+	}
+
+	portBuf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, portBuf); err != nil {
+		return "", fmt.Errorf("read bind port: %w", err)
+	}
+	port := binary.BigEndian.Uint16(portBuf)
+	return fmt.Sprintf("%s:%d", host, port), nil
+}
