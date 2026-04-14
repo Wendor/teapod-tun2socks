@@ -44,10 +44,15 @@ val jniLibsDir = layout.buildDirectory.dir("generated/jniLibs")
 // Задача для извлечения .so файлов из Go AAR
 tasks.register<Copy>("extractGoNativeLibs") {
     val goAarFile = file("../output/teapod-tun2socks.aar")
+    val targetArch = project.findProperty("targetArch") as? String
     
     // Используем closure для отложенного вычисления zipTree
     from(provider { zipTree(goAarFile) }) {
-        include("jni/**/*.so")
+        if (!targetArch.isNullOrBlank()) {
+            include("jni/$targetArch/**/*.so")
+        } else {
+            include("jni/**/*.so")
+        }
     }
     into(jniLibsDir)
     
