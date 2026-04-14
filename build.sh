@@ -33,6 +33,16 @@ ARCH_X86_64="amd64"  # -> x86_64
 
 ALL_ARCH="${ARCH_ARM64},${ARCH_ARM},${ARCH_X86_64}"
 
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+log()  { echo -e "${CYAN}▶ $*${NC}"; }
+ok()   { echo -e "${GREEN}✓ $*${NC}"; }
+warn() { echo -e "${YELLOW}⚠ $*${NC}"; }
+err()  { echo -e "${RED}✗ $*${NC}"; exit 1; }
+
 # --- Проверка зависимостей ---
 
 check_prerequisites() {
@@ -256,10 +266,15 @@ push_to_github() {
 
     # Создаем релиз и загружаем файлы
     # --generate-notes автоматически создаст описание релиза на основе коммитов
-    gh release create "${tag}" "${files[@]}" \
-        --title "Release ${tag}" \
-        --generate-notes
-
+    if gh release view "$tag" &>/dev/null; then
+      warn "Релиз $tag уже существует, обновляю..."
+      gh release upload "$tag" "${files[@]}" --clobber
+    else
+      gh release create "$tag" \
+        --title "TeapodStream $VERSION" \
+        --generate-notes \
+        "${files[@]}"
+    fi
     echo ""
     echo "=== Публикация завершена ==="
 }
