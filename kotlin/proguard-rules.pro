@@ -7,6 +7,10 @@
 # так как они вызываются через JNI по имени.
 -keep class tun2socks.** { *; }
 
+# ВАЖНО: Сохранить внутренние механизмы gomobile.
+# Без этого будет ошибка: failed to find method Seq.getRef
+-keep class go.** { *; }
+
 # Сохранить Kotlin-обёртки библиотеки.
 -keep class com.teapodstream.tun2socks.** { *; }
 
