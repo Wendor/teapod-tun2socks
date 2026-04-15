@@ -271,7 +271,7 @@ push_to_github() {
       gh release upload "$tag" "${files[@]}" --clobber
     else
       gh release create "$tag" \
-        --title "TeapodStream $VERSION" \
+        --title "TeapodStream $version" \
         --generate-notes \
         "${files[@]}"
     fi
