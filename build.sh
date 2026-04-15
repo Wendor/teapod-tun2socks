@@ -131,9 +131,11 @@ build_aar() {
     echo "Из директории: $(pwd)"
 
     # Выполняем gomobile bind
-    # Добавляем -v для отладки
+    # Добавляем -v для отладки, -ldflags="-s -w" для удаления символов и -trimpath
     gomobile bind \
         -v \
+        -ldflags="-s -w" \
+        -trimpath \
         -target="android/${arches//,/,android/}" \
         -androidapi="${MIN_ANDROID_API}" \
         -o "${OUTPUT_DIR}/${AAR_NAME}.aar" \
@@ -173,9 +175,11 @@ build_aar() {
 
     # Список архитектур Android для финальной упаковки
     local ANDROID_ARCHES=()
-    if [[ "${arches}" == *"${ARCH_ARM64}"* ]]; then ANDROID_ARCHES+=("arm64-v8a"); fi
-    if [[ "${arches}" == *"${ARCH_ARM}"* ]]; then ANDROID_ARCHES+=("armeabi-v7a"); fi
-    if [[ "${arches}" == *"${ARCH_X86_64}"* ]]; then ANDROID_ARCHES+=("x86_64"); fi
+    # Добавляем пробелы по краям для точного поиска подстроки
+    local arches_with_spaces=" ${arches//,/ } "
+    if [[ "${arches_with_spaces}" == *" ${ARCH_ARM64} "* ]]; then ANDROID_ARCHES+=("arm64-v8a"); fi
+    if [[ "${arches_with_spaces}" == *" ${ARCH_ARM} "* ]]; then ANDROID_ARCHES+=("armeabi-v7a"); fi
+    if [[ "${arches_with_spaces}" == *" ${ARCH_X86_64} "* ]]; then ANDROID_ARCHES+=("x86_64"); fi
     
     # Режим сборки: только поархитектурные AAR
     echo "--- Очистка перед сборкой ---"
@@ -231,7 +235,7 @@ push_to_github() {
 
     # Считываем версию из gradle.properties
     local version
-    version=$(grep "libraryVersion" "kotlin/gradle.properties" | cut -d'=' -f2 | tr -d ' \r\n')
+    version=$(grep "libraryVersion" "${SCRIPT_DIR}/kotlin/gradle.properties" | cut -d'=' -f2 | tr -d ' \r\n')
     [ -z "${version}" ] && version="1.0.0"
     local tag="v${version}"
 
@@ -285,7 +289,7 @@ push_to_github() {
 print_info() {
     # Считываем версию из gradle.properties
     local version
-    version=$(grep "libraryVersion" "kotlin/gradle.properties" | cut -d'=' -f2 | tr -d ' \r\n')
+    version=$(grep "libraryVersion" "${SCRIPT_DIR}/kotlin/gradle.properties" | cut -d'=' -f2 | tr -d ' \r\n')
     [ -z "${version}" ] && version="1.0.0"
 
     echo ""
