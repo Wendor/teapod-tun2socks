@@ -259,12 +259,6 @@ func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstP
 	defer gonetConn.Close()
 	defer assoc.Close()
 
-	relayConn, err := net.DialUDP("udp", nil, assoc.RelayAddr)
-	if err != nil {
-		return
-	}
-	defer relayConn.Close()
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -277,7 +271,7 @@ func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstP
 				return
 			}
 			datagram := EncodeUDPDatagram(dstIP, dstPort, buf[:n])
-			if _, err := relayConn.Write(datagram); err != nil {
+			if _, err := assoc.UDPConn.WriteToUDP(datagram, assoc.RelayAddr); err != nil {
 				return
 			}
 		}
@@ -287,7 +281,7 @@ func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstP
 		defer wg.Done()
 		buf := make([]byte, mtu+22)
 		for {
-			n, err := relayConn.Read(buf)
+			n, _, err := assoc.UDPConn.ReadFromUDP(buf)
 			if err != nil {
 				return
 			}

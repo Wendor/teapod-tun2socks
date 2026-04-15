@@ -42,22 +42,25 @@ func (s *SOCKS5Client) DialTCP(dstIP string, dstPort int) (net.Conn, error) {
 }
 
 // UDPAssociation holds an active SOCKS5 UDP ASSOCIATE session.
-// The caller must call Close when done — this closes the control TCP connection,
-// which signals the proxy to release the relay (RFC 1928 §7).
+// The caller must call Close when done — this closes the control TCP connection
+// and the local UDP socket.
 type UDPAssociation struct {
 	// RelayAddr is the proxy UDP relay address to send datagrams to.
 	RelayAddr *net.UDPAddr
+	// UDPConn is the bound local UDP socket used to communicate with the proxy.
+	UDPConn *net.UDPConn
 	// ctrl is the TCP control connection that must stay open for the relay lifetime.
 	ctrl net.Conn
 }
 
-// Close releases the UDP association by closing the TCP control connection.
-func (a *UDPAssociation) Close() error { return a.ctrl.Close() }
+// Close releases the UDP association by closing both the local UDP socket and the TCP control connection.
+func (a *UDPAssociation) Close() error {
+	a.UDPConn.Close()
+	return a.ctrl.Close()
+}
 
 // UDPAssociate sends a UDP ASSOCIATE command to the SOCKS5 proxy.
-// The returned UDPAssociation.RelayAddr is where datagrams should be sent.
-// The TCP control connection is kept open inside the UDPAssociation — call Close()
-// when the UDP session is done (RFC 1928 §7).
+// It pre-binds a local UDP port and sends it to the proxy to enforce Strict Source Binding.
 func (s *SOCKS5Client) UDPAssociate() (*UDPAssociation, error) {
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", s.host, s.port))
 	if err != nil {
@@ -69,31 +72,43 @@ func (s *SOCKS5Client) UDPAssociate() (*UDPAssociation, error) {
 		return nil, fmt.Errorf("socks5: handshake for UDP: %w", err)
 	}
 
-	// Send UDP ASSOCIATE with zeroed client address (proxy decides relay addr).
+	// 1. Bind local UDP port on loopback
+	localAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
+	udpConn, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: failed to bind local udp: %w", err)
+	}
+	boundPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+
+	// 2. Send UDP ASSOCIATE with the specific bound port
 	req := []byte{
 		0x05, 0x03, 0x00, // VER=5, CMD=UDP ASSOCIATE, RSV
 		0x01,             // ATYP: IPv4
-		0, 0, 0, 0,       // BND.ADDR: 0.0.0.0 (client doesn't specify)
-		0, 0,             // BND.PORT: 0
+		127, 0, 0, 1,     // BND.ADDR: 127.0.0.1
+		byte(boundPort >> 8), byte(boundPort), // BND.PORT: our allocated port
 	}
 	if _, err := conn.Write(req); err != nil {
+		udpConn.Close()
 		conn.Close()
 		return nil, fmt.Errorf("socks5: write UDP ASSOCIATE req: %w", err)
 	}
 
 	relayAddr, err := readSocksAddress(conn)
 	if err != nil {
+		udpConn.Close()
 		conn.Close()
 		return nil, fmt.Errorf("socks5: UDP ASSOCIATE response: %w", err)
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", relayAddr)
 	if err != nil {
+		udpConn.Close()
 		conn.Close()
 		return nil, fmt.Errorf("socks5: resolve relay addr %q: %w", relayAddr, err)
 	}
 
-	return &UDPAssociation{RelayAddr: udpAddr, ctrl: conn}, nil
+	return &UDPAssociation{RelayAddr: udpAddr, UDPConn: udpConn, ctrl: conn}, nil
 }
 
 // EncodeUDPDatagram wraps payload in a SOCKS5 UDP datagram header (RFC 1928 §7).
