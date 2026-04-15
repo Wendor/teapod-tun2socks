@@ -113,3 +113,27 @@ func (t *TeapodTun2socks) SetLogEnabled(enabled bool) {
 		hook.SetLogEnabled(enabled)
 	}
 }
+
+// GetUploadBytes returns the total amount of bytes read from TUN (upload to internet).
+func (t *TeapodTun2socks) GetUploadBytes() int64 {
+	t.mu.Lock()
+	engine := t.engine
+	t.mu.Unlock()
+
+	if engine == nil {
+		return 0
+	}
+	return int64(engine.txBytes.Load())
+}
+
+// GetDownloadBytes returns the total amount of bytes written to TUN (download from internet).
+func (t *TeapodTun2socks) GetDownloadBytes() int64 {
+	t.mu.Lock()
+	engine := t.engine
+	t.mu.Unlock()
+
+	if engine == nil {
+		return 0
+	}
+	return int64(engine.rxBytes.Load())
+}

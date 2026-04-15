@@ -39,6 +39,8 @@ type Engine struct {
 	wg        sync.WaitGroup
 	tunFile   *os.File
 	logPrefix string
+	txBytes   atomic.Uint64
+	rxBytes   atomic.Uint64
 }
 
 func NewEngine(tunFD int, socksHost string, socksPort int, socksUser, socksPass string, hook *EngineHook) (*Engine, error) {
@@ -142,6 +144,7 @@ func (e *Engine) tunReadLoop() {
 		if n == 0 {
 			continue
 		}
+		e.txBytes.Add(uint64(n))
 
 		pkt := buf[:n]
 		var proto tcpip.NetworkProtocolNumber
@@ -172,6 +175,8 @@ func (e *Engine) tunWriteLoop(ctx context.Context) {
 		data := v.AsSlice()
 		if _, err := e.tunFile.Write(data); err != nil && e.running.Load() {
 			log.Printf("%s TUN write: %v", e.logPrefix, err)
+		} else {
+			e.rxBytes.Add(uint64(len(data)))
 		}
 		v.Release()
 		pkt.DecRef()

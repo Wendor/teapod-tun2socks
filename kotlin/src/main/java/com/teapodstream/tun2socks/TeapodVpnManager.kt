@@ -167,6 +167,20 @@ class TeapodVpnManager(private val context: Context) {
         teapodTun2socks?.setLogEnabled(enabled)
     }
 
+    /**
+     * Возвращает общее количество байт, отправленных через TUN (Upload в интернет).
+     */
+    fun getUploadBytes(): Long {
+        return teapodTun2socks?.uploadBytes ?: 0L
+    }
+
+    /**
+     * Возвращает общее количество байт, полученных через TUN (Download из интернета).
+     */
+    fun getDownloadBytes(): Long {
+        return teapodTun2socks?.downloadBytes ?: 0L
+    }
+
     companion object {
         private const val TAG = "TeapodVpnManager"
 
