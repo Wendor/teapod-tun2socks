@@ -344,8 +344,6 @@ cd go/
 go mod tidy
 ```
 
-### "NDK not found"
-
 ```bash
 export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/<version>
 # или через Android Studio: Tools → SDK Manager → SDK Tools → NDK
