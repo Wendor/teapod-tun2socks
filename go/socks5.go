@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 )
+
+const dialTimeout = 5 * time.Second
 
 // SOCKS5Client implements a minimal SOCKS5 client (CONNECT and UDP ASSOCIATE).
 type SOCKS5Client struct {
@@ -23,7 +26,7 @@ func NewSOCKS5Client(host string, port int, username, password string) *SOCKS5Cl
 // DialTCP connects to the SOCKS5 proxy and issues a CONNECT command.
 // Returns the established proxy connection ready for use.
 func (s *SOCKS5Client) DialTCP(dstIP string, dstPort int) (net.Conn, error) {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", s.host, s.port))
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", s.host, s.port), dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("socks5: dial proxy: %w", err)
 	}
@@ -62,7 +65,7 @@ func (a *UDPAssociation) Close() error {
 // UDPAssociate sends a UDP ASSOCIATE command to the SOCKS5 proxy.
 // It pre-binds a local UDP port and sends it to the proxy to enforce Strict Source Binding.
 func (s *SOCKS5Client) UDPAssociate() (*UDPAssociation, error) {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", s.host, s.port))
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", s.host, s.port), dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("socks5: dial proxy for UDP ASSOCIATE: %w", err)
 	}

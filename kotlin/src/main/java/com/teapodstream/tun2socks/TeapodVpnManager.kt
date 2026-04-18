@@ -50,6 +50,7 @@ class TeapodVpnManager(private val context: Context) {
      * Запускает teapod-tun2socks.
      *
      * @param tunFd          TUN-интерфейс (ParcelFileDescriptor от VpnService)
+     * @param mtu            MTU TUN-интерфейса; должен совпадать со значением VpnService.Builder.setMtu()
      * @param socksHost      Адрес SOCKS5 прокси
      * @param socksPort      Порт SOCKS5 прокси
      * @param socksUsername  Имя пользователя SOCKS5 (пустая строка = без авторизации)
@@ -66,6 +67,7 @@ class TeapodVpnManager(private val context: Context) {
     @Synchronized
     fun start(
         tunFd: ParcelFileDescriptor,
+        mtu: Int = DEFAULT_MTU,
         socksHost: String,
         socksPort: Int,
         socksUsername: String = "",
@@ -85,7 +87,7 @@ class TeapodVpnManager(private val context: Context) {
             throw IllegalArgumentException("ParcelFileDescriptor содержит невалидный fd: $fd")
         }
 
-        Log.i(TAG, "Starting teapod-tun2socks: fd=$fd socks=$socksHost:$socksPort mode=$whitelistMode uids=${allowedUids.size}")
+        Log.i(TAG, "Starting teapod-tun2socks: fd=$fd mtu=$mtu socks=$socksHost:$socksPort mode=$whitelistMode uids=${allowedUids.size}")
 
         // Создаём резолвер UID
         val uidResolver = UidResolver(context)
@@ -103,6 +105,7 @@ class TeapodVpnManager(private val context: Context) {
             setLogEnabled(ENABLE_DEBUG_LOGS)
             val error = start(
                 fd.toLong(),
+                mtu.toLong(),
                 socksHost,
                 socksPort.toLong(),
                 socksUsername,
@@ -189,6 +192,9 @@ class TeapodVpnManager(private val context: Context) {
 
         /** TTL записей кэша по умолчанию (секунды = 5 минут). */
         const val DEFAULT_CACHE_TTL = 300
+
+        /** MTU TUN-интерфейса по умолчанию. */
+        const val DEFAULT_MTU = 1500
 
         /** Включить DEBUG-логи Go-слоя (для разработки). */
         private const val ENABLE_DEBUG_LOGS = false

@@ -25,7 +25,6 @@ import (
 )
 
 const (
-	mtu         = 1500
 	channelSize = 256
 	nicID       tcpip.NICID = 1
 )
@@ -34,6 +33,7 @@ type Engine struct {
 	stack     *stack.Stack
 	endpoint  *channel.Endpoint
 	hook      *EngineHook
+	mtu       int
 	running   atomic.Bool
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
@@ -43,7 +43,7 @@ type Engine struct {
 	rxBytes   atomic.Uint64
 }
 
-func NewEngine(tunFD int, socksHost string, socksPort int, socksUser, socksPass string, hook *EngineHook) (*Engine, error) {
+func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, socksPass string, hook *EngineHook) (*Engine, error) {
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
@@ -56,7 +56,7 @@ func NewEngine(tunFD int, socksHost string, socksPort int, socksUser, socksPass 
 		HandleLocal: false,
 	})
 
-	ep := channel.New(channelSize, mtu, "")
+	ep := channel.New(channelSize, uint32(mtu), "")
 
 	if tcpipErr := s.CreateNIC(nicID, ep); tcpipErr != nil {
 		s.Close()
@@ -77,7 +77,7 @@ func NewEngine(tunFD int, socksHost string, socksPort int, socksUser, socksPass 
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
 	udpForwarder := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
-		go handleUDPForwarder(r, hook, socksHost, socksPort, socksUser, socksPass)
+		go handleUDPForwarder(r, hook, socksHost, socksPort, socksUser, socksPass, mtu)
 		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
@@ -93,9 +93,10 @@ func NewEngine(tunFD int, socksHost string, socksPort int, socksUser, socksPass 
 		stack:     s,
 		endpoint:  ep,
 		hook:      hook,
+		mtu:       mtu,
 		tunFile:   os.NewFile(uintptr(dupFD), "tun"),
 		stopCh:    make(chan struct{}),
-		logPrefix: fmt.Sprintf("[teapod-tun2socks fd=%d]", tunFD),
+		logPrefix: fmt.Sprintf("[teapod-tun2socks fd=%d mtu=%d]", tunFD, mtu),
 	}, nil
 }
 
@@ -126,7 +127,7 @@ func (e *Engine) Start() error {
 }
 
 func (e *Engine) tunReadLoop() {
-	buf := make([]byte, mtu+4)
+	buf := make([]byte, e.mtu+4)
 	for {
 		select {
 		case <-e.stopCh:
@@ -231,7 +232,7 @@ func handleTCPForwarder(req *tcp.ForwarderRequest, hook *EngineHook, socksHost s
 	go pipeConnections(gonetConn, proxyConn)
 }
 
-func handleUDPForwarder(req *udp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string) {
+func handleUDPForwarder(req *udp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, mtu int) {
 	id := req.ID()
 	srcIP := net.IP(id.RemoteAddress.AsSlice())
 	dstIP := net.IP(id.LocalAddress.AsSlice())
@@ -257,10 +258,10 @@ func handleUDPForwarder(req *udp.ForwarderRequest, hook *EngineHook, socksHost s
 		return
 	}
 
-	go pipeUDP(gonetConn, assoc, dstIP, int(dstPort))
+	go pipeUDP(gonetConn, assoc, dstIP, int(dstPort), mtu)
 }
 
-func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstPort int) {
+func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstPort int, mtu int) {
 	defer gonetConn.Close()
 	defer assoc.Close()
 
@@ -292,6 +293,7 @@ func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstP
 			}
 			_, _, payload, err := DecodeUDPDatagram(buf[:n])
 			if err != nil {
+				log.Printf("[teapod-tun2socks] UDP datagram dropped: %v", err)
 				continue
 			}
 			if _, err := gonetConn.Write(payload); err != nil {
