@@ -77,6 +77,14 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
 	udpForwarder := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
+		id := r.ID()
+		srcIP := net.IP(id.RemoteAddress.AsSlice())
+		dstIP := net.IP(id.LocalAddress.AsSlice())
+		
+		if allowed, _ := hook.Validate(srcIP, id.RemotePort, dstIP, id.LocalPort, uint8(ProtocolUDP)); !allowed {
+			return false 
+		}
+		
 		go handleUDPForwarder(r, hook, socksHost, socksPort, socksUser, socksPass, mtu)
 		return true
 	})
@@ -234,14 +242,8 @@ func handleTCPForwarder(req *tcp.ForwarderRequest, hook *EngineHook, socksHost s
 
 func handleUDPForwarder(req *udp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, mtu int) {
 	id := req.ID()
-	srcIP := net.IP(id.RemoteAddress.AsSlice())
 	dstIP := net.IP(id.LocalAddress.AsSlice())
-	srcPort := id.RemotePort
 	dstPort := id.LocalPort
-
-	if allowed, _ := hook.Validate(srcIP, srcPort, dstIP, dstPort, uint8(ProtocolUDP)); !allowed {
-		return
-	}
 
 	var wq waiter.Queue
 	ep, tcpipErr := req.CreateEndpoint(&wq)
