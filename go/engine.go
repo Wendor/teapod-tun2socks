@@ -256,6 +256,7 @@ func handleUDPForwarder(req *udp.ForwarderRequest, hook *EngineHook, socksHost s
 	socks := NewSOCKS5Client(socksHost, socksPort, socksUser, socksPass)
 	assoc, err := socks.UDPAssociate()
 	if err != nil {
+		log.Printf("[teapod-tun2socks] UDP ASSOCIATE failed for %s:%d: %v", dstIP, dstPort, err)
 		gonetConn.Close()
 		return
 	}

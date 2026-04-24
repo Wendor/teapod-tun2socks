@@ -8,7 +8,13 @@ import (
 	"time"
 )
 
-const dialTimeout = 5 * time.Second
+const (
+	dialTimeout      = 5 * time.Second
+	// Time allowed for the full SOCKS5 handshake + CONNECT response.
+	// xray only sends CONNECT response after establishing the upstream connection,
+	// so this must cover both xray's own dial timeout and local latency.
+	handshakeTimeout = 30 * time.Second
+)
 
 // SOCKS5Client implements a minimal SOCKS5 client (CONNECT and UDP ASSOCIATE).
 type SOCKS5Client struct {
@@ -31,6 +37,16 @@ func (s *SOCKS5Client) DialTCP(dstIP string, dstPort int) (net.Conn, error) {
 		return nil, fmt.Errorf("socks5: dial proxy: %w", err)
 	}
 
+	// Bound the entire handshake+CONNECT phase. Without this deadline the goroutine
+	// blocks indefinitely in io.ReadFull: xray accepts the TCP connection immediately
+	// but only sends the CONNECT response after establishing its own upstream connection.
+	// During network transitions (WiFi→LTE) that upstream dial can hang for tens of
+	// seconds, causing all forwarding goroutines to pile up while IsRunning()=true.
+	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: set deadline: %w", err)
+	}
+
 	if err := s.handshake(conn); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("socks5: handshake: %w", err)
@@ -39,6 +55,12 @@ func (s *SOCKS5Client) DialTCP(dstIP string, dstPort int) (net.Conn, error) {
 	if err := s.sendConnect(conn, dstIP, dstPort); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("socks5: CONNECT: %w", err)
+	}
+
+	// Clear deadline: the data pipe must not be limited by handshakeTimeout.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: clear deadline: %w", err)
 	}
 
 	return conn, nil
@@ -68,6 +90,11 @@ func (s *SOCKS5Client) UDPAssociate() (*UDPAssociation, error) {
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", s.host, s.port), dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("socks5: dial proxy for UDP ASSOCIATE: %w", err)
+	}
+
+	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: set deadline: %w", err)
 	}
 
 	if err := s.handshake(conn); err != nil {
@@ -109,6 +136,14 @@ func (s *SOCKS5Client) UDPAssociate() (*UDPAssociation, error) {
 		udpConn.Close()
 		conn.Close()
 		return nil, fmt.Errorf("socks5: resolve relay addr %q: %w", relayAddr, err)
+	}
+
+	// The control TCP connection must stay open for the lifetime of the UDP relay.
+	// Clear the handshake deadline so it doesn't expire during a long UDP session.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		udpConn.Close()
+		conn.Close()
+		return nil, fmt.Errorf("socks5: clear deadline: %w", err)
 	}
 
 	return &UDPAssociation{RelayAddr: udpAddr, UDPConn: udpConn, ctrl: conn}, nil
