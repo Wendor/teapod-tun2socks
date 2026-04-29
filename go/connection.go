@@ -9,8 +9,10 @@ import (
 
 // Protocol type constants
 const (
-	ProtocolTCP = 6
-	ProtocolUDP = 17
+	ProtocolTCP   = 6
+	ProtocolUDP   = 17
+	ProtocolICMP  = 1   // ICMPv4
+	ProtocolICMPv6 = 58 // ICMPv6
 )
 
 // ConnectionKey uniquely identifies a network flow.

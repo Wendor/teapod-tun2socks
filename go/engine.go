@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/gvisor/pkg/buffer"
 	"github.com/sagernet/gvisor/pkg/tcpip"
@@ -26,7 +27,12 @@ import (
 
 const (
 	channelSize = 256
-	nicID       tcpip.NICID = 1
+	nicID        tcpip.NICID = 1
+	// udpIdleTimeout is the maximum idle time for a UDP flow before its goroutines
+	// and sockets are released. The deadline is reset on every received packet, so
+	// active sessions (QUIC, gaming) stay alive indefinitely; only truly idle flows
+	// (finished DNS queries, stale connections) are cleaned up.
+	udpIdleTimeout = 60 * time.Second
 )
 
 type Engine struct {
@@ -160,8 +166,23 @@ func (e *Engine) tunReadLoop() {
 		switch pkt[0] >> 4 {
 		case 4:
 			proto = header.IPv4ProtocolNumber
+			// Filter ICMPv4 packets to prevent unauthorized apps from bypassing checks
+			if len(pkt) > 9 && pkt[9] == ProtocolICMP {
+				if shouldBlockICMP(pkt, false) {
+					log.Printf("%s ICMPv4 blocked (echo)", e.logPrefix)
+					continue
+				}
+			}
 		case 6:
 			proto = header.IPv6ProtocolNumber
+			// Filter ICMPv6 packets
+			if len(pkt) > 6 {
+				nextHeader := pkt[6]
+				if nextHeader == ProtocolICMPv6 && shouldBlockICMP(pkt, true) {
+					log.Printf("%s ICMPv6 blocked (echo)", e.logPrefix)
+					continue
+				}
+			}
 		default:
 			continue
 		}
@@ -172,6 +193,45 @@ func (e *Engine) tunReadLoop() {
 		e.endpoint.InjectInbound(proto, pkb)
 		pkb.DecRef()
 	}
+}
+
+// shouldBlockICMP checks if an ICMP packet should be blocked.
+// For IPv4, ICMP header starts after the IP header (IHL * 4 bytes).
+// For IPv6, ICMP header starts after the fixed 40-byte IPv6 header.
+// Blocks Echo Request (type 8/128) and Echo Reply (type 0/129) to prevent
+// unauthorized apps from using ping to bypass application filters.
+// Allows all other ICMP types (error messages like Destination Unreachable, etc.)
+func shouldBlockICMP(pkt []byte, isIPv6 bool) bool {
+	var icmpTypeOffset int
+	if isIPv6 {
+		if len(pkt) < 40 {
+			return true // Malformed packet
+		}
+		icmpTypeOffset = 40 // ICMPv6 header starts after fixed IPv6 header
+	} else {
+		if len(pkt) < 20 {
+			return true // Malformed packet
+		}
+		// IPv4 IHL is in bits 4-7 of byte 0, in 32-bit words
+		ihl := int(pkt[0]&0x0F) * 4
+		if len(pkt) < ihl+1 {
+			return true // Malformed packet
+		}
+		icmpTypeOffset = ihl
+	}
+
+	if len(pkt) <= icmpTypeOffset {
+		return true
+	}
+
+	icmpType := pkt[icmpTypeOffset]
+	// Block Echo Request and Echo Reply for both IPv4 and IPv6
+	// IPv4: Echo Request = 8, Echo Reply = 0
+	// IPv6: Echo Request = 128, Echo Reply = 129
+	if icmpType == 0 || icmpType == 8 || icmpType == 128 || icmpType == 129 {
+		return true
+	}
+	return false
 }
 
 func (e *Engine) tunWriteLoop(ctx context.Context) {
@@ -265,16 +325,31 @@ func handleUDPForwarder(req *udp.ForwarderRequest, hook *EngineHook, socksHost s
 }
 
 func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstPort int, mtu int) {
-	defer gonetConn.Close()
-	defer assoc.Close()
+	// shutdown closes both ends exactly once, unblocking whichever goroutine is
+	// still blocked on a read. Each goroutine calls defer shutdown() so that when
+	// either side exits (error, idle timeout, or upstream close) the other side is
+	// guaranteed to unblock and exit immediately.
+	var once sync.Once
+	shutdown := func() {
+		once.Do(func() {
+			gonetConn.Close()
+			assoc.Close()
+		})
+	}
+	defer shutdown()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// TUN -> relay: read from gVisor endpoint, forward to SOCKS5 UDP relay.
 	go func() {
 		defer wg.Done()
+		defer shutdown()
 		buf := make([]byte, mtu)
 		for {
+			// Idle-based deadline: reset before every read so the timeout only fires
+			// when no packet has arrived for udpIdleTimeout, not after an absolute time.
+			gonetConn.SetReadDeadline(time.Now().Add(udpIdleTimeout))
 			n, err := gonetConn.Read(buf)
 			if err != nil {
 				return
@@ -286,10 +361,13 @@ func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstP
 		}
 	}()
 
+	// relay -> TUN: read responses from SOCKS5 UDP relay, forward to gVisor endpoint.
 	go func() {
 		defer wg.Done()
+		defer shutdown()
 		buf := make([]byte, mtu+22)
 		for {
+			assoc.UDPConn.SetReadDeadline(time.Now().Add(udpIdleTimeout))
 			n, _, err := assoc.UDPConn.ReadFromUDP(buf)
 			if err != nil {
 				return
