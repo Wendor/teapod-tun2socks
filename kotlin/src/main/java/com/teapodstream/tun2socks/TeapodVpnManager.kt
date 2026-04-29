@@ -72,6 +72,7 @@ class TeapodVpnManager(private val context: Context) {
         socksPort: Int,
         socksUsername: String = "",
         socksPassword: String = "",
+        allowIcmp: Boolean = true,
         allowedUids: Set<Int> = emptySet(),
         whitelistMode: WhitelistMode = WhitelistMode.ALLOW_ONLY,
         cacheCapacity: Int = DEFAULT_CACHE_CAPACITY,
@@ -110,6 +111,7 @@ class TeapodVpnManager(private val context: Context) {
                 socksPort.toLong(),
                 socksUsername,
                 socksPassword,
+                allowIcmp,
                 cacheCapacity.toLong(),
                 cacheTtlSeconds.toLong(),
                 callback
