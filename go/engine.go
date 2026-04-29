@@ -43,13 +43,14 @@ type Engine struct {
 	running   atomic.Bool
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
-	tunFile   *os.File
-	logPrefix string
+	tunFile    *os.File
+	logPrefix  string
+	allowICMP  bool
 	txBytes   atomic.Uint64
 	rxBytes   atomic.Uint64
 }
 
-func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, socksPass string, hook *EngineHook) (*Engine, error) {
+func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, socksPass string, allowICMP bool, hook *EngineHook) (*Engine, error) {
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
@@ -111,6 +112,7 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 		tunFile:   os.NewFile(uintptr(dupFD), "tun"),
 		stopCh:    make(chan struct{}),
 		logPrefix: fmt.Sprintf("[teapod-tun2socks fd=%d mtu=%d]", tunFD, mtu),
+		allowICMP:  allowICMP,
 	}, nil
 }
 
@@ -166,8 +168,10 @@ func (e *Engine) tunReadLoop() {
 		switch pkt[0] >> 4 {
 		case 4:
 			proto = header.IPv4ProtocolNumber
-			// Filter ICMPv4 packets to prevent unauthorized apps from bypassing checks
-			if len(pkt) > 9 && pkt[9] == ProtocolICMP {
+			// Filter ICMPv4 echo packets when allowICMP is disabled.
+			// ICMP has no source ports, so per-app UID lookup is not possible;
+			// the filter applies to all apps uniformly.
+			if !e.allowICMP && len(pkt) > 9 && pkt[9] == ProtocolICMP {
 				if shouldBlockICMP(pkt, false) {
 					log.Printf("%s ICMPv4 blocked (echo)", e.logPrefix)
 					continue
@@ -175,8 +179,8 @@ func (e *Engine) tunReadLoop() {
 			}
 		case 6:
 			proto = header.IPv6ProtocolNumber
-			// Filter ICMPv6 packets
-			if len(pkt) > 6 {
+			// Filter ICMPv6 echo packets when allowICMP is disabled.
+			if !e.allowICMP && len(pkt) > 6 {
 				nextHeader := pkt[6]
 				if nextHeader == ProtocolICMPv6 && shouldBlockICMP(pkt, true) {
 					log.Printf("%s ICMPv6 blocked (echo)", e.logPrefix)
