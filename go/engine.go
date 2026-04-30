@@ -3,7 +3,6 @@ package tun2socks
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -33,6 +32,11 @@ const (
 	// active sessions (QUIC, gaming) stay alive indefinitely; only truly idle flows
 	// (finished DNS queries, stale connections) are cleaned up.
 	udpIdleTimeout = 60 * time.Second
+	// tcpIdleTimeout is the maximum idle time for a TCP flow. The deadline is reset
+	// on every received chunk, so active transfers (streaming, downloads) are unaffected.
+	// Stuck connections (e.g. after an LTE tower handover with no FIN/RST) are cleaned up
+	// before they fill the gVisor TCP forwarder backlog (limit: 1024).
+	tcpIdleTimeout = 5 * time.Minute
 )
 
 type Engine struct {
@@ -154,7 +158,11 @@ func (e *Engine) tunReadLoop() {
 		n, err := e.tunFile.Read(buf)
 		if err != nil {
 			if e.running.Load() {
-				log.Printf("%s TUN read: %v", e.logPrefix, err)
+				// TUN fd was closed externally (e.g. Android revoked VPN during a phone call
+				// without calling onRevoke). Trigger Stop() so IsRunning() returns false,
+				// which the Kotlin heartbeat detects and uses to trigger a reconnect.
+				log.Printf("%s TUN read error — fd closed externally, triggering stop: %v", e.logPrefix, err)
+				go e.Stop() // must be async: Stop calls wg.Wait which would deadlock if called directly
 			}
 			return
 		}
@@ -391,12 +399,42 @@ func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstP
 }
 
 func pipeConnections(left, right net.Conn) {
-	defer left.Close()
-	defer right.Close()
+	// shutdown closes both ends exactly once, unblocking whichever goroutine is
+	// still blocked on a read — same pattern as pipeUDP.
+	var once sync.Once
+	shutdown := func() {
+		once.Do(func() {
+			left.Close()
+			right.Close()
+		})
+	}
+	defer shutdown()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = io.Copy(left, right) }()
-	go func() { defer wg.Done(); _, _ = io.Copy(right, left) }()
+
+	// pipe copies src → dst with an idle-based deadline that resets on every chunk.
+	// This ensures stuck connections (no FIN/RST after a network change) are cleaned
+	// up within tcpIdleTimeout, preventing the gVisor forwarder backlog from filling.
+	pipe := func(dst, src net.Conn) {
+		defer wg.Done()
+		defer shutdown()
+		buf := make([]byte, 32*1024)
+		for {
+			src.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
+			n, err := src.Read(buf)
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+
+	go pipe(right, left)
+	go pipe(left, right)
 	wg.Wait()
 }
