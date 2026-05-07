@@ -34,7 +34,10 @@ var tcpBufPool = sync.Pool{
 }
 
 const (
-	channelSize = 256
+	// channelSize is the gVisor outbound packet channel capacity (gVisor → tunWriteLoop).
+	// Must be large enough to absorb bursts: 256 was too small and caused dropped SYN-ACKs
+	// and ACKs when Telegram received multiple media notifications simultaneously.
+	channelSize = 4096
 	nicID        tcpip.NICID = 1
 	// udpIdleTimeout is the maximum idle time for a UDP flow before its goroutines
 	// and sockets are released. The deadline is reset on every received packet, so
@@ -49,20 +52,21 @@ const (
 )
 
 type Engine struct {
-	stack     *stack.Stack
-	endpoint  *channel.Endpoint
-	hook      *EngineHook
-	mtu       int
-	running   atomic.Bool
-	stopCh    chan struct{}
-	wg        sync.WaitGroup
-	tunFile    *os.File
-	logPrefix  string
-	allowICMP  bool
-	txBytes   atomic.Uint64
-	rxBytes   atomic.Uint64
-	ctx       context.Context
-	cancel    context.CancelFunc
+	stack       *stack.Stack
+	endpoint    *channel.Endpoint
+	hook        *EngineHook
+	mtu         int
+	running     atomic.Bool
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	tunFile     *os.File
+	logPrefix   string
+	allowICMP   bool
+	txBytes     atomic.Uint64
+	rxBytes     atomic.Uint64
+	activeConns atomic.Int64
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, socksPass string, allowICMP bool, hook *EngineHook) (*Engine, error) {
@@ -93,6 +97,18 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 	s.SetPromiscuousMode(nicID, true)
 	s.SetSpoofing(nicID, true)
 
+	// Proxy-mode TCP tuning: aggressively clean up dead state.
+	// In a TUN proxy the addressing is virtual, so RFC 793 TIME_WAIT and linger
+	// guarantees are meaningless. The defaults (60 s each) cause hundreds of entries
+	// to accumulate in gVisor's endpoint table under Doze-mode + reconnect bursts,
+	// which over several hours degrades new connection establishment.
+	twTimeout := tcpip.TCPTimeWaitTimeoutOption(0) // disable TIME_WAIT entirely
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &twTimeout)
+	twReuse := tcpip.TCPTimeWaitReuseOption(tcpip.TCPTimeWaitReuseGlobal)
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &twReuse)
+	linger := tcpip.TCPLingerTimeoutOption(time.Second)
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &linger)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
 		stack:     s,
@@ -109,7 +125,7 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 	// Forwarder closures capture e so they can pass e.ctx to SOCKS5 dials,
 	// allowing Stop() to cancel in-flight dials immediately via e.cancel().
 	tcpForwarder := tcp.NewForwarder(s, 65535, 1024, func(r *tcp.ForwarderRequest) {
-		go handleTCPForwarder(e.ctx, r, hook, socksHost, socksPort, socksUser, socksPass)
+		go handleTCPForwarder(e.ctx, r, hook, socksHost, socksPort, socksUser, socksPass, &e.activeConns)
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
@@ -292,9 +308,33 @@ func (e *Engine) Stop() {
 	log.Printf("%s engine shut down complete", e.logPrefix)
 }
 
-func (e *Engine) IsRunning() bool { return e.running.Load() }
+func (e *Engine) IsRunning() bool  { return e.running.Load() }
+func (e *Engine) ActiveConns() int64 { return e.activeConns.Load() }
 
-func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string) {
+// LogStats emits a single log line with key tunnel health metrics:
+//   - activeConns  — TCP proxy goroutines currently running
+//   - gvisorEstab  — gVisor TCP endpoints in ESTABLISHED state
+//   - gvisorConn   — gVisor TCP endpoints counted as "connected"
+//   - chanQueued   — packets buffered in the gVisor→TUN channel (capacity: channelSize)
+//   - txMB/rxMB    — cumulative bytes through TUN since start
+//
+// Useful for detecting: goroutine leaks (activeConns spike), channel overflow
+// (chanQueued near 4096), or gVisor endpoint table bloat (gvisorEstab >> activeConns).
+func (e *Engine) LogStats(cacheLen int) {
+	stats := e.stack.Stats()
+	log.Printf("%s tunnel stats: activeConns=%d gvisorEstab=%d gvisorConn=%d chanQueued=%d/%d txMB=%.1f rxMB=%.1f cacheEntries=%d",
+		e.logPrefix,
+		e.activeConns.Load(),
+		stats.TCP.CurrentEstablished.Value(),
+		stats.TCP.CurrentConnected.Value(),
+		e.endpoint.NumQueued(), channelSize,
+		float64(e.txBytes.Load())/1e6,
+		float64(e.rxBytes.Load())/1e6,
+		cacheLen,
+	)
+}
+
+func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, activeConns *atomic.Int64) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[teapod-tun2socks] panic in TCP forwarder: %v", r)
@@ -331,7 +371,11 @@ func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *En
 		return
 	}
 
-	go pipeConnections(gonetConn, proxyConn)
+	activeConns.Add(1)
+	go func() {
+		defer activeConns.Add(-1)
+		pipeConnections(gonetConn, proxyConn)
+	}()
 }
 
 func handleUDPForwarder(ctx context.Context, req *udp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, mtu int) {

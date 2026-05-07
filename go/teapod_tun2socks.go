@@ -115,6 +115,38 @@ func (t *TeapodTun2socks) SetLogEnabled(enabled bool) {
 	}
 }
 
+// GetActiveConnections returns the number of TCP connections currently being proxied.
+// A sustained spike (e.g. > 200) after hours of uptime indicates a connection leak.
+func (t *TeapodTun2socks) GetActiveConnections() int64 {
+	t.mu.Lock()
+	engine := t.engine
+	t.mu.Unlock()
+
+	if engine == nil {
+		return 0
+	}
+	return engine.ActiveConns()
+}
+
+// LogStats emits a single log line with key tunnel health metrics (active conns,
+// gVisor TCP state counters, channel queue depth, cumulative bytes, cache size).
+// Call periodically from the Kotlin heartbeat for diagnostic visibility.
+func (t *TeapodTun2socks) LogStats() {
+	t.mu.Lock()
+	engine := t.engine
+	hook := t.hook
+	t.mu.Unlock()
+
+	if engine == nil {
+		return
+	}
+	cacheLen := 0
+	if hook != nil {
+		cacheLen = hook.CacheLen()
+	}
+	engine.LogStats(cacheLen)
+}
+
 // GetUploadBytes returns the total amount of bytes read from TUN (upload to internet).
 func (t *TeapodTun2socks) GetUploadBytes() int64 {
 	t.mu.Lock()
