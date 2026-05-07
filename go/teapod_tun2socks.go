@@ -128,23 +128,24 @@ func (t *TeapodTun2socks) GetActiveConnections() int64 {
 	return engine.ActiveConns()
 }
 
-// LogStats emits a single log line with key tunnel health metrics (active conns,
-// gVisor TCP state counters, channel queue depth, cumulative bytes, cache size).
-// Call periodically from the Kotlin heartbeat for diagnostic visibility.
-func (t *TeapodTun2socks) LogStats() {
+// GetStatsLine returns a diagnostic string with key tunnel health metrics
+// (active conns, gVisor TCP counters, channel queue depth, byte counters, cache size).
+// Intended to be logged by the Kotlin caller via its own log() so the line
+// ends up in vpn_log.txt and the Flutter UI, not only in Android logcat.
+func (t *TeapodTun2socks) GetStatsLine() string {
 	t.mu.Lock()
 	engine := t.engine
 	hook := t.hook
 	t.mu.Unlock()
 
 	if engine == nil {
-		return
+		return ""
 	}
 	cacheLen := 0
 	if hook != nil {
 		cacheLen = hook.CacheLen()
 	}
-	engine.LogStats(cacheLen)
+	return engine.StatsLine(cacheLen)
 }
 
 // GetUploadBytes returns the total amount of bytes read from TUN (upload to internet).

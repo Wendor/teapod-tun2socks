@@ -311,7 +311,7 @@ func (e *Engine) Stop() {
 func (e *Engine) IsRunning() bool  { return e.running.Load() }
 func (e *Engine) ActiveConns() int64 { return e.activeConns.Load() }
 
-// LogStats emits a single log line with key tunnel health metrics:
+// StatsLine returns a single diagnostic string with key tunnel health metrics:
 //   - activeConns  — TCP proxy goroutines currently running
 //   - gvisorEstab  — gVisor TCP endpoints in ESTABLISHED state
 //   - gvisorConn   — gVisor TCP endpoints counted as "connected"
@@ -320,10 +320,9 @@ func (e *Engine) ActiveConns() int64 { return e.activeConns.Load() }
 //
 // Useful for detecting: goroutine leaks (activeConns spike), channel overflow
 // (chanQueued near 4096), or gVisor endpoint table bloat (gvisorEstab >> activeConns).
-func (e *Engine) LogStats(cacheLen int) {
+func (e *Engine) StatsLine(cacheLen int) string {
 	stats := e.stack.Stats()
-	log.Printf("%s tunnel stats: activeConns=%d gvisorEstab=%d gvisorConn=%d chanQueued=%d/%d txMB=%.1f rxMB=%.1f cacheEntries=%d",
-		e.logPrefix,
+	return fmt.Sprintf("activeConns=%d gvisorEstab=%d gvisorConn=%d chanQueued=%d/%d txMB=%.1f rxMB=%.1f cacheEntries=%d",
 		e.activeConns.Load(),
 		stats.TCP.CurrentEstablished.Value(),
 		stats.TCP.CurrentConnected.Value(),
@@ -332,6 +331,12 @@ func (e *Engine) LogStats(cacheLen int) {
 		float64(e.rxBytes.Load())/1e6,
 		cacheLen,
 	)
+}
+
+// LogStats writes StatsLine to Go's standard logger (→ Android logcat tag "GoLog").
+// For routing into vpn_log.txt and Flutter UI, use StatsLine() from Kotlin instead.
+func (e *Engine) LogStats(cacheLen int) {
+	log.Printf("%s tunnel stats: %s", e.logPrefix, e.StatsLine(cacheLen))
 }
 
 func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, activeConns *atomic.Int64) {
