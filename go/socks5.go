@@ -1,6 +1,7 @@
 package tun2socks
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -31,8 +32,11 @@ func NewSOCKS5Client(host string, port int, username, password string) *SOCKS5Cl
 
 // DialTCP connects to the SOCKS5 proxy and issues a CONNECT command.
 // Returns the established proxy connection ready for use.
-func (s *SOCKS5Client) DialTCP(dstIP string, dstPort int) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", s.host, s.port), dialTimeout)
+// ctx is used to cancel the initial TCP dial (e.g. when the engine is stopped);
+// once the connection is established the context is not watched.
+func (s *SOCKS5Client) DialTCP(ctx context.Context, dstIP string, dstPort int) (net.Conn, error) {
+	d := net.Dialer{Timeout: dialTimeout}
+	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", s.host, s.port))
 	if err != nil {
 		return nil, fmt.Errorf("socks5: dial proxy: %w", err)
 	}
@@ -86,8 +90,10 @@ func (a *UDPAssociation) Close() error {
 
 // UDPAssociate sends a UDP ASSOCIATE command to the SOCKS5 proxy.
 // It pre-binds a local UDP port and sends it to the proxy to enforce Strict Source Binding.
-func (s *SOCKS5Client) UDPAssociate() (*UDPAssociation, error) {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", s.host, s.port), dialTimeout)
+// ctx cancels the initial TCP dial; once established the context is not watched.
+func (s *SOCKS5Client) UDPAssociate(ctx context.Context) (*UDPAssociation, error) {
+	d := net.Dialer{Timeout: dialTimeout}
+	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", s.host, s.port))
 	if err != nil {
 		return nil, fmt.Errorf("socks5: dial proxy for UDP ASSOCIATE: %w", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,17 +27,18 @@ type EngineHook struct {
 	cache      *LRUCache
 	validator  UIDValidatorFunc
 	mu         sync.RWMutex
-	logEnabled bool
+	logEnabled atomic.Bool
 }
 
 // NewEngineHook creates a new hook.
 // capacity — max entries in the LRU cache
 // ttlSeconds — TTL for cached entries in seconds
 func NewEngineHook(capacity int, ttlSeconds int) *EngineHook {
-	return &EngineHook{
-		cache:      NewLRUCache(capacity, time.Duration(ttlSeconds)*time.Second),
-		logEnabled: true,
+	h := &EngineHook{
+		cache: NewLRUCache(capacity, time.Duration(ttlSeconds)*time.Second),
 	}
+	h.logEnabled.Store(true)
+	return h
 }
 
 // SetValidator sets the Kotlin callback.
@@ -51,7 +53,7 @@ func (h *EngineHook) Validate(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPor
 	key := NewConnectionKey(srcIP, srcPort, dstIP, dstPort, proto)
 
 	if result, ok := h.cache.Get(key); ok {
-		if h.logEnabled {
+		if h.logEnabled.Load() {
 			log.Printf("[teapod-tun2socks] cache HIT %s — allowed=%v", key, result.Allowed)
 		}
 		return result.Allowed, result.UID
@@ -72,7 +74,7 @@ func (h *EngineHook) Validate(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPor
 		int(proto),
 	)
 
-	if h.logEnabled {
+	if h.logEnabled.Load() {
 		log.Printf("[teapod-tun2socks] cache MISS %s — allowed=%v (from Kotlin)", key, allowed)
 	}
 
@@ -90,4 +92,4 @@ func (h *EngineHook) Invalidate(srcIP net.IP, srcPort uint16, dstIP net.IP, dstP
 func (h *EngineHook) CacheLen() int { return h.cache.Len() }
 
 // SetLogEnabled toggles internal logging.
-func (h *EngineHook) SetLogEnabled(enabled bool) { h.logEnabled = enabled }
+func (h *EngineHook) SetLogEnabled(enabled bool) { h.logEnabled.Store(enabled) }

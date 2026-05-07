@@ -24,6 +24,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// tcpBufPool reuses 32 KB read buffers across TCP pipe goroutines, reducing
+// per-connection allocations from O(connections) to O(peak concurrent connections).
+var tcpBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 const (
 	channelSize = 256
 	nicID        tcpip.NICID = 1
@@ -52,6 +61,8 @@ type Engine struct {
 	allowICMP  bool
 	txBytes   atomic.Uint64
 	rxBytes   atomic.Uint64
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, socksPass string, allowICMP bool, hook *EngineHook) (*Engine, error) {
@@ -82,8 +93,23 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 	s.SetPromiscuousMode(nicID, true)
 	s.SetSpoofing(nicID, true)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	e := &Engine{
+		stack:     s,
+		endpoint:  ep,
+		hook:      hook,
+		mtu:       mtu,
+		stopCh:    make(chan struct{}),
+		logPrefix: fmt.Sprintf("[teapod-tun2socks fd=%d mtu=%d]", tunFD, mtu),
+		allowICMP:  allowICMP,
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+
+	// Forwarder closures capture e so they can pass e.ctx to SOCKS5 dials,
+	// allowing Stop() to cancel in-flight dials immediately via e.cancel().
 	tcpForwarder := tcp.NewForwarder(s, 65535, 1024, func(r *tcp.ForwarderRequest) {
-		go handleTCPForwarder(r, hook, socksHost, socksPort, socksUser, socksPass)
+		go handleTCPForwarder(e.ctx, r, hook, socksHost, socksPort, socksUser, socksPass)
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
@@ -91,12 +117,12 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 		id := r.ID()
 		srcIP := net.IP(id.RemoteAddress.AsSlice())
 		dstIP := net.IP(id.LocalAddress.AsSlice())
-		
+
 		if allowed, _ := hook.Validate(srcIP, id.RemotePort, dstIP, id.LocalPort, uint8(ProtocolUDP)); !allowed {
-			return false 
+			return false
 		}
-		
-		go handleUDPForwarder(r, hook, socksHost, socksPort, socksUser, socksPass, mtu)
+
+		go handleUDPForwarder(e.ctx, r, hook, socksHost, socksPort, socksUser, socksPass, mtu)
 		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
@@ -104,20 +130,13 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 	dupFD, err := unix.Dup(tunFD)
 	if err != nil {
 		s.Close()
+		cancel()
 		return nil, fmt.Errorf("dup tunFD: %v", err)
 	}
 	unix.CloseOnExec(dupFD)
+	e.tunFile = os.NewFile(uintptr(dupFD), "tun")
 
-	return &Engine{
-		stack:     s,
-		endpoint:  ep,
-		hook:      hook,
-		mtu:       mtu,
-		tunFile:   os.NewFile(uintptr(dupFD), "tun"),
-		stopCh:    make(chan struct{}),
-		logPrefix: fmt.Sprintf("[teapod-tun2socks fd=%d mtu=%d]", tunFD, mtu),
-		allowICMP:  allowICMP,
-	}, nil
+	return e, nil
 }
 
 func (e *Engine) Start() error {
@@ -125,8 +144,6 @@ func (e *Engine) Start() error {
 		return fmt.Errorf("engine already running")
 	}
 	log.Printf("%s engine started", e.logPrefix)
-
-	ctx, cancel := context.WithCancel(context.Background())
 
 	e.wg.Add(1)
 	go func() {
@@ -137,11 +154,10 @@ func (e *Engine) Start() error {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		e.tunWriteLoop(ctx)
+		e.tunWriteLoop(e.ctx)
 	}()
 
 	<-e.stopCh
-	cancel()
 	log.Printf("%s engine stopped", e.logPrefix)
 	return nil
 }
@@ -232,7 +248,7 @@ func shouldBlockICMP(pkt []byte, isIPv6 bool) bool {
 		icmpTypeOffset = ihl
 	}
 
-	if len(pkt) <= icmpTypeOffset {
+	if len(pkt) < icmpTypeOffset+1 {
 		return true
 	}
 
@@ -268,6 +284,7 @@ func (e *Engine) Stop() {
 	if !e.running.CompareAndSwap(true, false) {
 		return
 	}
+	e.cancel() // unblock any in-flight SOCKS5 DialContext in forwarder goroutines
 	close(e.stopCh)
 	e.tunFile.Close()
 	e.stack.Close()
@@ -277,7 +294,12 @@ func (e *Engine) Stop() {
 
 func (e *Engine) IsRunning() bool { return e.running.Load() }
 
-func handleTCPForwarder(req *tcp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string) {
+func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[teapod-tun2socks] panic in TCP forwarder: %v", r)
+		}
+	}()
 	id := req.ID()
 	// gVisor Forwarder: 
 	// RemoteAddress is the Source (Phone).
@@ -303,7 +325,7 @@ func handleTCPForwarder(req *tcp.ForwarderRequest, hook *EngineHook, socksHost s
 	gonetConn := gonet.NewTCPConn(&wq, ep)
 
 	proxyConn, dialErr := NewSOCKS5Client(socksHost, socksPort, socksUser, socksPass).
-		DialTCP(dstIP.String(), int(dstPort))
+		DialTCP(ctx, dstIP.String(), int(dstPort))
 	if dialErr != nil {
 		gonetConn.Close()
 		return
@@ -312,7 +334,12 @@ func handleTCPForwarder(req *tcp.ForwarderRequest, hook *EngineHook, socksHost s
 	go pipeConnections(gonetConn, proxyConn)
 }
 
-func handleUDPForwarder(req *udp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, mtu int) {
+func handleUDPForwarder(ctx context.Context, req *udp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, mtu int) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[teapod-tun2socks] panic in UDP forwarder: %v", r)
+		}
+	}()
 	id := req.ID()
 	dstIP := net.IP(id.LocalAddress.AsSlice())
 	dstPort := id.LocalPort
@@ -326,7 +353,7 @@ func handleUDPForwarder(req *udp.ForwarderRequest, hook *EngineHook, socksHost s
 	gonetConn := gonet.NewUDPConn(&wq, ep)
 
 	socks := NewSOCKS5Client(socksHost, socksPort, socksUser, socksPass)
-	assoc, err := socks.UDPAssociate()
+	assoc, err := socks.UDPAssociate(ctx)
 	if err != nil {
 		log.Printf("[teapod-tun2socks] UDP ASSOCIATE failed for %s:%d: %v", dstIP, dstPort, err)
 		gonetConn.Close()
@@ -337,6 +364,11 @@ func handleUDPForwarder(req *udp.ForwarderRequest, hook *EngineHook, socksHost s
 }
 
 func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstPort int, mtu int) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[teapod-tun2socks] panic in pipeUDP: %v", r)
+		}
+	}()
 	// shutdown closes both ends exactly once, unblocking whichever goroutine is
 	// still blocked on a read. Each goroutine calls defer shutdown() so that when
 	// either side exits (error, idle timeout, or upstream close) the other side is
@@ -399,6 +431,11 @@ func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstP
 }
 
 func pipeConnections(left, right net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[teapod-tun2socks] panic in pipeConnections: %v", r)
+		}
+	}()
 	// shutdown closes both ends exactly once, unblocking whichever goroutine is
 	// still blocked on a read — same pattern as pipeUDP.
 	var once sync.Once
@@ -419,11 +456,14 @@ func pipeConnections(left, right net.Conn) {
 	pipe := func(dst, src net.Conn) {
 		defer wg.Done()
 		defer shutdown()
-		buf := make([]byte, 32*1024)
+		bufPtr := tcpBufPool.Get().(*[]byte)
+		buf := *bufPtr
+		defer tcpBufPool.Put(bufPtr)
 		for {
 			src.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
 			n, err := src.Read(buf)
 			if n > 0 {
+				dst.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
 				if _, werr := dst.Write(buf[:n]); werr != nil {
 					return
 				}
