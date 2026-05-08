@@ -408,6 +408,7 @@ func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *En
 	proxyConn, dialErr := NewSOCKS5Client(socksHost, socksPort, socksUser, socksPass).
 		DialTCP(ctx, dstIP.String(), int(dstPort))
 	if dialErr != nil {
+		log.Printf("[teapod-tun2socks] SOCKS5 dial %s:%d failed: %v", dstIP, dstPort, dialErr)
 		gonetConn.Close()
 		return
 	}
