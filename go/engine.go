@@ -65,6 +65,7 @@ type Engine struct {
 	txBytes     atomic.Uint64
 	rxBytes     atomic.Uint64
 	activeConns atomic.Int64
+	lastRxMs    atomic.Int64
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
@@ -290,6 +291,7 @@ func (e *Engine) tunWriteLoop(ctx context.Context) {
 			log.Printf("%s TUN write: %v", e.logPrefix, err)
 		} else {
 			e.rxBytes.Add(uint64(len(data)))
+			e.lastRxMs.Store(time.Now().UnixMilli())
 		}
 		v.Release()
 		pkt.DecRef()
@@ -308,8 +310,9 @@ func (e *Engine) Stop() {
 	log.Printf("%s engine shut down complete", e.logPrefix)
 }
 
-func (e *Engine) IsRunning() bool  { return e.running.Load() }
-func (e *Engine) ActiveConns() int64 { return e.activeConns.Load() }
+func (e *Engine) IsRunning() bool     { return e.running.Load() }
+func (e *Engine) ActiveConns() int64  { return e.activeConns.Load() }
+func (e *Engine) LastRxMs() int64     { return e.lastRxMs.Load() }
 
 // StatsLine returns a single diagnostic string with key tunnel health metrics:
 //   - activeConns  — TCP proxy goroutines currently running
