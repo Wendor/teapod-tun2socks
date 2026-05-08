@@ -68,6 +68,9 @@ type Engine struct {
 	lastRxMs    atomic.Int64
 	ctx         context.Context
 	cancel      context.CancelFunc
+	connsMu     sync.Mutex
+	conns       map[uint64]net.Conn
+	connsSeq    atomic.Uint64
 }
 
 func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, socksPass string, allowICMP bool, hook *EngineHook) (*Engine, error) {
@@ -118,15 +121,16 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 		mtu:       mtu,
 		stopCh:    make(chan struct{}),
 		logPrefix: fmt.Sprintf("[teapod-tun2socks fd=%d mtu=%d]", tunFD, mtu),
-		allowICMP:  allowICMP,
+		allowICMP: allowICMP,
 		ctx:       ctx,
 		cancel:    cancel,
+		conns:     make(map[uint64]net.Conn),
 	}
 
 	// Forwarder closures capture e so they can pass e.ctx to SOCKS5 dials,
 	// allowing Stop() to cancel in-flight dials immediately via e.cancel().
 	tcpForwarder := tcp.NewForwarder(s, 65535, 1024, func(r *tcp.ForwarderRequest) {
-		go handleTCPForwarder(e.ctx, r, hook, socksHost, socksPort, socksUser, socksPass, &e.activeConns)
+		go handleTCPForwarder(e.ctx, r, hook, socksHost, socksPort, socksUser, socksPass, e)
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
@@ -310,9 +314,38 @@ func (e *Engine) Stop() {
 	log.Printf("%s engine shut down complete", e.logPrefix)
 }
 
-func (e *Engine) IsRunning() bool     { return e.running.Load() }
-func (e *Engine) ActiveConns() int64  { return e.activeConns.Load() }
-func (e *Engine) LastRxMs() int64     { return e.lastRxMs.Load() }
+func (e *Engine) IsRunning() bool    { return e.running.Load() }
+func (e *Engine) ActiveConns() int64 { return e.activeConns.Load() }
+func (e *Engine) LastRxMs() int64    { return e.lastRxMs.Load() }
+
+func (e *Engine) trackConn(id uint64, c net.Conn) {
+	e.connsMu.Lock()
+	e.conns[id] = c
+	e.connsMu.Unlock()
+}
+
+func (e *Engine) untrackConn(id uint64) {
+	e.connsMu.Lock()
+	delete(e.conns, id)
+	e.connsMu.Unlock()
+}
+
+// CloseAllConnections closes the gVisor side of every active proxied TCP
+// connection. Each goroutine pair in pipeConnections detects the close and
+// exits, causing the remote app to receive a connection reset and reconnect.
+// Returns the number of connections that were closed.
+func (e *Engine) CloseAllConnections() int {
+	e.connsMu.Lock()
+	snapshot := make([]net.Conn, 0, len(e.conns))
+	for _, c := range e.conns {
+		snapshot = append(snapshot, c)
+	}
+	e.connsMu.Unlock()
+	for _, c := range snapshot {
+		c.Close()
+	}
+	return len(snapshot)
+}
 
 // StatsLine returns a single diagnostic string with key tunnel health metrics:
 //   - activeConns  — TCP proxy goroutines currently running
@@ -342,14 +375,14 @@ func (e *Engine) LogStats(cacheLen int) {
 	log.Printf("%s tunnel stats: %s", e.logPrefix, e.StatsLine(cacheLen))
 }
 
-func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, activeConns *atomic.Int64) {
+func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, e *Engine) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[teapod-tun2socks] panic in TCP forwarder: %v", r)
 		}
 	}()
 	id := req.ID()
-	// gVisor Forwarder: 
+	// gVisor Forwarder:
 	// RemoteAddress is the Source (Phone).
 	// LocalAddress is the Destination (Internet).
 	srcIP := net.IP(id.RemoteAddress.AsSlice())
@@ -379,9 +412,12 @@ func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *En
 		return
 	}
 
-	activeConns.Add(1)
+	connID := e.connsSeq.Add(1)
+	e.trackConn(connID, gonetConn)
+	e.activeConns.Add(1)
 	go func() {
-		defer activeConns.Add(-1)
+		defer e.activeConns.Add(-1)
+		defer e.untrackConn(connID)
 		pipeConnections(gonetConn, proxyConn)
 	}()
 }

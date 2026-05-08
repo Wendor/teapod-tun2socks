@@ -187,3 +187,19 @@ func (t *TeapodTun2socks) GetLastRxActivityMs() int64 {
 	}
 	return engine.LastRxMs()
 }
+
+// ForceCloseAllConnections closes the gVisor side of every active proxied TCP
+// connection. Each connection's goroutine pair exits and the app receives a reset,
+// causing it to reconnect through a clean path. Call this on network-change events
+// to prevent stale gVisor connections from surviving across physical network switches.
+// Returns the number of connections that were closed. No-op if not running.
+func (t *TeapodTun2socks) ForceCloseAllConnections() int64 {
+	t.mu.Lock()
+	engine := t.engine
+	t.mu.Unlock()
+
+	if engine == nil {
+		return 0
+	}
+	return int64(engine.CloseAllConnections())
+}
