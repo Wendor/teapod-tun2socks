@@ -3,6 +3,7 @@ package tun2socks
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -52,25 +53,28 @@ const (
 )
 
 type Engine struct {
-	stack       *stack.Stack
-	endpoint    *channel.Endpoint
-	hook        *EngineHook
-	mtu         int
-	running     atomic.Bool
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
-	tunFile     *os.File
-	logPrefix   string
-	allowICMP   bool
-	txBytes     atomic.Uint64
-	rxBytes     atomic.Uint64
-	activeConns atomic.Int64
-	lastRxMs    atomic.Int64
-	ctx         context.Context
-	cancel      context.CancelFunc
-	connsMu     sync.Mutex
-	conns       map[uint64]net.Conn
-	connsSeq    atomic.Uint64
+	stack          *stack.Stack
+	endpoint       *channel.Endpoint
+	hook           *EngineHook
+	mtu            int
+	running        atomic.Bool
+	stopCh         chan struct{}
+	wg             sync.WaitGroup
+	tunFile        *os.File
+	logPrefix      string
+	allowICMP      bool
+	txBytes        atomic.Uint64
+	rxBytes        atomic.Uint64
+	activeConns    atomic.Int64
+	activeUDPConns atomic.Int64
+	lastRxMs       atomic.Int64
+	ctx            context.Context
+	cancel         context.CancelFunc
+	connsMu        sync.Mutex
+	conns          map[uint64]net.Conn
+	udpConnsMu     sync.Mutex
+	udpConns       map[uint64]net.Conn
+	connsSeq       atomic.Uint64
 }
 
 func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, socksPass string, allowICMP bool, hook *EngineHook) (*Engine, error) {
@@ -115,16 +119,17 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
-		stack:     s,
-		endpoint:  ep,
-		hook:      hook,
-		mtu:       mtu,
-		stopCh:    make(chan struct{}),
+		stack:    s,
+		endpoint: ep,
+		hook:     hook,
+		mtu:      mtu,
+		stopCh:   make(chan struct{}),
 		logPrefix: fmt.Sprintf("[teapod-tun2socks fd=%d mtu=%d]", tunFD, mtu),
 		allowICMP: allowICMP,
-		ctx:       ctx,
-		cancel:    cancel,
-		conns:     make(map[uint64]net.Conn),
+		ctx:      ctx,
+		cancel:   cancel,
+		conns:    make(map[uint64]net.Conn),
+		udpConns: make(map[uint64]net.Conn),
 	}
 
 	// Forwarder closures capture e so they can pass e.ctx to SOCKS5 dials,
@@ -143,7 +148,7 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 			return false
 		}
 
-		go handleUDPForwarder(e.ctx, r, hook, socksHost, socksPort, socksUser, socksPass, mtu)
+		go handleUDPForwarder(e.ctx, r, hook, socksHost, socksPort, socksUser, socksPass, mtu, e)
 		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
@@ -315,7 +320,7 @@ func (e *Engine) Stop() {
 }
 
 func (e *Engine) IsRunning() bool    { return e.running.Load() }
-func (e *Engine) ActiveConns() int64 { return e.activeConns.Load() }
+func (e *Engine) ActiveConns() int64 { return e.activeConns.Load() + e.activeUDPConns.Load() }
 func (e *Engine) LastRxMs() int64    { return e.lastRxMs.Load() }
 
 func (e *Engine) trackConn(id uint64, c net.Conn) {
@@ -330,36 +335,59 @@ func (e *Engine) untrackConn(id uint64) {
 	e.connsMu.Unlock()
 }
 
-// CloseAllConnections closes the gVisor side of every active proxied TCP
-// connection. Each goroutine pair in pipeConnections detects the close and
-// exits, causing the remote app to receive a connection reset and reconnect.
-// Returns the number of connections that were closed.
+func (e *Engine) trackUDPConn(id uint64, c net.Conn) {
+	e.udpConnsMu.Lock()
+	e.udpConns[id] = c
+	e.udpConnsMu.Unlock()
+}
+
+func (e *Engine) untrackUDPConn(id uint64) {
+	e.udpConnsMu.Lock()
+	delete(e.udpConns, id)
+	e.udpConnsMu.Unlock()
+}
+
+// CloseAllConnections closes the gVisor side of every active proxied TCP and UDP
+// connection. Each goroutine pair detects the close and exits, causing apps to
+// receive a reset and reconnect. Returns the total number of connections closed.
 func (e *Engine) CloseAllConnections() int {
 	e.connsMu.Lock()
-	snapshot := make([]net.Conn, 0, len(e.conns))
+	tcpSnap := make([]net.Conn, 0, len(e.conns))
 	for _, c := range e.conns {
-		snapshot = append(snapshot, c)
+		tcpSnap = append(tcpSnap, c)
 	}
 	e.connsMu.Unlock()
-	for _, c := range snapshot {
+
+	e.udpConnsMu.Lock()
+	udpSnap := make([]net.Conn, 0, len(e.udpConns))
+	for _, c := range e.udpConns {
+		udpSnap = append(udpSnap, c)
+	}
+	e.udpConnsMu.Unlock()
+
+	for _, c := range tcpSnap {
 		c.Close()
 	}
-	return len(snapshot)
+	for _, c := range udpSnap {
+		c.Close()
+	}
+	return len(tcpSnap) + len(udpSnap)
 }
 
 // StatsLine returns a single diagnostic string with key tunnel health metrics:
-//   - activeConns  — TCP proxy goroutines currently running
-//   - gvisorEstab  — gVisor TCP endpoints in ESTABLISHED state
-//   - gvisorConn   — gVisor TCP endpoints counted as "connected"
-//   - chanQueued   — packets buffered in the gVisor→TUN channel (capacity: channelSize)
-//   - txMB/rxMB    — cumulative bytes through TUN since start
+//   - tcpConns/udpConns — active TCP and UDP proxy goroutines
+//   - gvisorEstab       — gVisor TCP endpoints in ESTABLISHED state
+//   - gvisorConn        — gVisor TCP endpoints counted as "connected"
+//   - chanQueued        — packets buffered in the gVisor→TUN channel (capacity: channelSize)
+//   - txMB/rxMB         — cumulative bytes through TUN since start
 //
-// Useful for detecting: goroutine leaks (activeConns spike), channel overflow
-// (chanQueued near 4096), or gVisor endpoint table bloat (gvisorEstab >> activeConns).
+// Useful for detecting: goroutine leaks (tcpConns/udpConns spike), channel overflow
+// (chanQueued near 4096), or gVisor endpoint table bloat (gvisorEstab >> tcpConns).
 func (e *Engine) StatsLine(cacheLen int) string {
 	stats := e.stack.Stats()
-	return fmt.Sprintf("activeConns=%d gvisorEstab=%d gvisorConn=%d chanQueued=%d/%d txMB=%.1f rxMB=%.1f cacheEntries=%d",
+	return fmt.Sprintf("tcpConns=%d udpConns=%d gvisorEstab=%d gvisorConn=%d chanQueued=%d/%d txMB=%.1f rxMB=%.1f cacheEntries=%d",
 		e.activeConns.Load(),
+		e.activeUDPConns.Load(),
 		stats.TCP.CurrentEstablished.Value(),
 		stats.TCP.CurrentConnected.Value(),
 		e.endpoint.NumQueued(), channelSize,
@@ -423,7 +451,7 @@ func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *En
 	}()
 }
 
-func handleUDPForwarder(ctx context.Context, req *udp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, mtu int) {
+func handleUDPForwarder(ctx context.Context, req *udp.ForwarderRequest, hook *EngineHook, socksHost string, socksPort int, socksUser, socksPass string, mtu int, e *Engine) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[teapod-tun2socks] panic in UDP forwarder: %v", r)
@@ -449,7 +477,14 @@ func handleUDPForwarder(ctx context.Context, req *udp.ForwarderRequest, hook *En
 		return
 	}
 
-	go pipeUDP(gonetConn, assoc, dstIP, int(dstPort), mtu)
+	connID := e.connsSeq.Add(1)
+	e.trackUDPConn(connID, gonetConn)
+	e.activeUDPConns.Add(1)
+	go func() {
+		defer e.activeUDPConns.Add(-1)
+		defer e.untrackUDPConn(connID)
+		pipeUDP(gonetConn, assoc, dstIP, int(dstPort), mtu)
+	}()
 }
 
 func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstPort int, mtu int) {
@@ -470,6 +505,16 @@ func pipeUDP(gonetConn *gonet.UDPConn, assoc *UDPAssociation, dstIP net.IP, dstP
 		})
 	}
 	defer shutdown()
+
+	// Monitor the SOCKS5 control TCP connection: if xray closes it, tear down the relay
+	// immediately instead of waiting for the 60-second UDP idle timeout. This handles
+	// the case where xray drops the UDP ASSOCIATE (restart, resource pressure, etc.)
+	// without us noticing — without this, pipeUDP hangs for up to 60s while the app
+	// waits for responses that will never arrive.
+	go func() {
+		defer shutdown()
+		io.Copy(io.Discard, assoc.ctrl)
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
