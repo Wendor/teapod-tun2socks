@@ -63,6 +63,7 @@ type Engine struct {
 	tunFile        *os.File
 	logPrefix      string
 	allowICMP      bool
+	blockQuic      bool
 	txBytes        atomic.Uint64
 	rxBytes        atomic.Uint64
 	activeConns    atomic.Int64
@@ -77,7 +78,7 @@ type Engine struct {
 	connsSeq       atomic.Uint64
 }
 
-func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, socksPass string, allowICMP bool, hook *EngineHook) (*Engine, error) {
+func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, socksPass string, allowICMP, blockQuic bool, hook *EngineHook) (*Engine, error) {
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
@@ -126,6 +127,7 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 		stopCh:   make(chan struct{}),
 		logPrefix: fmt.Sprintf("[teapod-tun2socks fd=%d mtu=%d]", tunFD, mtu),
 		allowICMP: allowICMP,
+		blockQuic: blockQuic,
 		ctx:      ctx,
 		cancel:   cancel,
 		conns:    make(map[uint64]net.Conn),
@@ -227,6 +229,18 @@ func (e *Engine) tunReadLoop() {
 					continue
 				}
 			}
+			// Reject QUIC (UDP 443) inline with an ICMP Port Unreachable. Without this,
+			// browsers send their full QUIC retransmission sequence (~55s of exponential
+			// backoff) before falling back to TCP, during which all HTTP/2 streams to the
+			// same host stall in the browser's connection queue.
+			if e.blockQuic && isUDPDstPortIPv4(pkt, 443) {
+				if resp := buildICMPv4PortUnreachable(pkt); resp != nil {
+					if _, werr := e.tunFile.Write(resp); werr != nil && e.running.Load() {
+						log.Printf("%s ICMPv4 unreachable write failed: %v", e.logPrefix, werr)
+					}
+				}
+				continue
+			}
 		case 6:
 			proto = header.IPv6ProtocolNumber
 			// Filter ICMPv6 echo packets when allowICMP is disabled.
@@ -236,6 +250,14 @@ func (e *Engine) tunReadLoop() {
 					log.Printf("%s ICMPv6 blocked (echo)", e.logPrefix)
 					continue
 				}
+			}
+			if e.blockQuic && isUDPDstPortIPv6(pkt, 443) {
+				if resp := buildICMPv6PortUnreachable(pkt); resp != nil {
+					if _, werr := e.tunFile.Write(resp); werr != nil && e.running.Load() {
+						log.Printf("%s ICMPv6 unreachable write failed: %v", e.logPrefix, werr)
+					}
+				}
+				continue
 			}
 		default:
 			continue

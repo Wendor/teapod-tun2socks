@@ -34,7 +34,7 @@ func NewTeapodTun2socks() *TeapodTun2socks {
 //	validator        — Kotlin callback implementing UID validation
 //
 // Returns an error string (empty on success).
-func (t *TeapodTun2socks) Start(tunFD int64, mtu int64, socksHost string, socksPort int64, socksUsername, socksPassword string, allowICMP bool, cacheCapacity int64, cacheTTLSeconds int64, validator UIDValidatorFunc) string {
+func (t *TeapodTun2socks) Start(tunFD int64, mtu int64, socksHost string, socksPort int64, socksUsername, socksPassword string, allowICMP, blockQuic bool, cacheCapacity int64, cacheTTLSeconds int64, validator UIDValidatorFunc) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -45,7 +45,7 @@ func (t *TeapodTun2socks) Start(tunFD int64, mtu int64, socksHost string, socksP
 	hook := NewEngineHook(int(cacheCapacity), int(cacheTTLSeconds))
 	hook.SetValidator(validator)
 
-	engine, err := NewEngine(int(tunFD), int(mtu), socksHost, int(socksPort), socksUsername, socksPassword, allowICMP, hook)
+	engine, err := NewEngine(int(tunFD), int(mtu), socksHost, int(socksPort), socksUsername, socksPassword, allowICMP, blockQuic, hook)
 	if err != nil {
 		log.Printf("[teapod-tun2socks] Start error: %v", err)
 		return fmt.Sprintf("engine creation failed: %v", err)
@@ -60,8 +60,8 @@ func (t *TeapodTun2socks) Start(tunFD int64, mtu int64, socksHost string, socksP
 		}
 	}()
 
-	log.Printf("[teapod-tun2socks] started: socks=%s:%d mtu=%d allowICMP=%v cache_capacity=%d cache_ttl=%ds",
-		socksHost, socksPort, mtu, allowICMP, cacheCapacity, cacheTTLSeconds)
+	log.Printf("[teapod-tun2socks] started: socks=%s:%d mtu=%d allowICMP=%v blockQuic=%v cache_capacity=%d cache_ttl=%ds",
+		socksHost, socksPort, mtu, allowICMP, blockQuic, cacheCapacity, cacheTTLSeconds)
 	return ""
 }
 
