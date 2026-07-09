@@ -188,6 +188,24 @@ func (t *TeapodTun2socks) GetLastRxActivityMs() int64 {
 	return engine.LastRxMs()
 }
 
+// GetDiagnostics returns a JSON snapshot of the tunnel state (health metrics,
+// failure counters, per-connection activity table). Empty string if not running.
+func (t *TeapodTun2socks) GetDiagnostics() string {
+	t.mu.Lock()
+	engine := t.engine
+	hook := t.hook
+	t.mu.Unlock()
+
+	if engine == nil {
+		return ""
+	}
+	cacheLen := 0
+	if hook != nil {
+		cacheLen = hook.CacheLen()
+	}
+	return engine.Diagnostics(cacheLen)
+}
+
 // ForceCloseAllConnections closes the gVisor side of every active proxied TCP
 // connection. Each connection's goroutine pair exits and the app receives a reset,
 // causing it to reconnect through a clean path. Call this on network-change events

@@ -138,11 +138,62 @@ func isUDPDstPortIPv4(pkt []byte, port uint16) bool {
 	return binary.BigEndian.Uint16(pkt[ihl+2:ihl+4]) == port
 }
 
-// isUDPDstPortIPv6 reports whether the packet is an IPv6 UDP datagram (no extension
-// headers) destined for the given destination port.
+// isUDPDstPortIPv6 reports whether the packet is an IPv6 UDP datagram destined for
+// the given destination port, walking any extension header chain first.
 func isUDPDstPortIPv6(pkt []byte, port uint16) bool {
-	if len(pkt) < 48 || pkt[6] != ProtocolUDP {
+	proto, off, ok := ipv6TransportHeader(pkt)
+	if !ok || proto != ProtocolUDP {
 		return false
 	}
-	return binary.BigEndian.Uint16(pkt[42:44]) == port
+	if len(pkt) < off+4 {
+		return false
+	}
+	return binary.BigEndian.Uint16(pkt[off+2:off+4]) == port
+}
+
+// ipv6TransportHeader walks the IPv6 extension header chain starting at the fixed
+// 40-byte base header and returns the upper-layer protocol number and the byte
+// offset at which its header begins.
+//
+// This matters for filtering: reading pkt[6] alone yields the FIRST next-header
+// value, which for a packet carrying extension headers (Hop-by-Hop, Routing,
+// Destination Options, Fragment) is an extension type, not the transport protocol.
+// Without walking the chain, an ICMPv6 echo or QUIC datagram tucked behind a
+// Hop-by-Hop header slips past the echo/QUIC filters unexamined.
+//
+// ok is false for malformed/truncated packets or an unterminated header chain.
+func ipv6TransportHeader(pkt []byte) (proto uint8, offset int, ok bool) {
+	if len(pkt) < 40 {
+		return 0, 0, false
+	}
+	next := pkt[6]
+	off := 40
+	// Bound the walk to avoid pathological/looping chains.
+	for i := 0; i < 8; i++ {
+		switch next {
+		case 0, 43, 60: // Hop-by-Hop, Routing, Destination Options
+			if len(pkt) < off+2 {
+				return 0, 0, false
+			}
+			// Hdr Ext Len is in 8-octet units, not counting the first 8 octets.
+			hdrLen := (int(pkt[off+1]) + 1) * 8
+			next = pkt[off]
+			off += hdrLen
+		case 44: // Fragment header — fixed 8 bytes
+			if len(pkt) < off+8 {
+				return 0, 0, false
+			}
+			next = pkt[off]
+			off += 8
+		case 59: // No Next Header
+			return 0, 0, false
+		default:
+			// Upper-layer protocol (TCP, UDP, ICMPv6, ...).
+			if off > len(pkt) {
+				return 0, 0, false
+			}
+			return next, off, true
+		}
+	}
+	return 0, 0, false
 }
