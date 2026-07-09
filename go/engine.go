@@ -192,13 +192,12 @@ func NewEngine(tunFD int, mtu int, socksHost string, socksPort int, socksUser, s
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
 	udpForwarder := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
-		id := r.ID()
-		srcIP := net.IP(id.RemoteAddress.AsSlice())
-		dstIP := net.IP(id.LocalAddress.AsSlice())
-
-		if allowed, _ := hook.Validate(srcIP, id.RemotePort, dstIP, id.LocalPort, uint8(ProtocolUDP)); !allowed {
-			return false
-		}
+		// No hook.Validate here: this callback runs synchronously in the packet
+		// delivery path (tunReadLoop → InjectInbound). A validation cache miss costs
+		// a 20-100ms Kotlin IPC, stalling ALL tunnel traffic — and every DNS query
+		// from a fresh ephemeral port is a miss. Validation happens in
+		// handleUDPForwarder instead (same as TCP since v1.1.13); denied flows are
+		// silently dropped there.
 
 		// Reject new flows once the association cap is reached, so a fan-out burst
 		// cannot exhaust file descriptors. The slot is reserved synchronously here
@@ -399,8 +398,10 @@ func (e *Engine) tunWriteLoop(ctx context.Context) {
 		}
 		v := pkt.ToView()
 		data := v.AsSlice()
-		if _, err := e.tunFile.Write(data); err != nil && e.running.Load() {
-			log.Printf("%s TUN write: %v", e.logPrefix, err)
+		if _, err := e.tunFile.Write(data); err != nil {
+			if e.running.Load() {
+				log.Printf("%s TUN write: %v", e.logPrefix, err)
+			}
 		} else {
 			e.rxBytes.Add(uint64(len(data)))
 			e.lastRxMs.Store(time.Now().UnixMilli())
@@ -584,6 +585,12 @@ func handleTCPForwarder(ctx context.Context, req *tcp.ForwarderRequest, hook *En
 		req.Complete(true)
 		return
 	}
+	// Remove the request from the forwarder's inFlight table (gVisor API contract:
+	// "Clients must eventually call Complete()"; CreateEndpoint does NOT do it).
+	// Without this every connection leaks one inFlight entry; after maxInFlight
+	// (1024) leaked entries gVisor silently drops every new SYN — the tunnel looks
+	// alive (heartbeat bypasses TUN) but no new TCP connection can be established.
+	req.Complete(false)
 
 	ep.SocketOptions().SetKeepAlive(false)
 	gonetConn := gonet.NewTCPConn(&wq, ep)
@@ -633,6 +640,7 @@ func handleUDPForwarder(ctx context.Context, req *udp.ForwarderRequest, hook *En
 		}
 	}()
 	id := req.ID()
+	srcIP := net.IP(id.RemoteAddress.AsSlice())
 	dstIP := net.IP(id.LocalAddress.AsSlice())
 	dstPort := id.LocalPort
 
@@ -643,6 +651,12 @@ func handleUDPForwarder(ctx context.Context, req *udp.ForwarderRequest, hook *En
 	}
 
 	gonetConn := gonet.NewUDPConn(&wq, ep)
+
+	// Validate off the packet path (see the forwarder callback for why).
+	if allowed, _ := hook.Validate(srcIP, id.RemotePort, dstIP, dstPort, uint8(ProtocolUDP)); !allowed {
+		gonetConn.Close()
+		return
+	}
 
 	socks := NewSOCKS5Client(socksHost, socksPort, socksUser, socksPass)
 	assoc, err := socks.UDPAssociate(ctx)
