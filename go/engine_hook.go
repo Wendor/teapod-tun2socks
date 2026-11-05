@@ -23,18 +23,18 @@ type UIDValidatorFunc interface {
 }
 
 // EngineHook ties the LRU cache together with the UID validator callback.
+//
+// The cache key is the full 5-tuple. A src-only UDP cache existed while UDP was
+// validated on the packet path; it is gone because every app on the TUN shares
+// the source IP, so the key was just a port: an excluded app bound to tun0 could
+// reuse a port an allowed app had just used and be admitted (learning the VPN
+// exit), and a cached deny blocked the next allowed app that got the port.
+// Validation now runs in the per-flow goroutine, so a miss no longer stalls the TUN.
 type EngineHook struct {
 	cache      *LRUCache
-	// udpSrcCache caches UDP validation by (srcIP, srcPort) only.
-	// Telegram and other QUIC apps open many UDP flows from one socket (same srcPort)
-	// to different CDN servers. Without this cache every new dst triggers a synchronous
-	// Kotlin IPC call (getConnectionOwnerUid), blocking tunReadLoop for each one.
-	// The UID is determined by the source socket, not the destination, so caching by
-	// src alone is correct for UDP.
-	udpSrcCache *LRUCache
-	validator   UIDValidatorFunc
-	mu          sync.RWMutex
-	logEnabled  atomic.Bool
+	validator  UIDValidatorFunc
+	mu         sync.RWMutex
+	logEnabled atomic.Bool
 }
 
 // NewEngineHook creates a new hook.
@@ -43,10 +43,10 @@ type EngineHook struct {
 func NewEngineHook(capacity int, ttlSeconds int) *EngineHook {
 	ttl := time.Duration(ttlSeconds) * time.Second
 	h := &EngineHook{
-		cache:       NewLRUCache(capacity, ttl),
-		udpSrcCache: NewLRUCache(capacity, ttl),
+		cache: NewLRUCache(capacity, ttl),
 	}
-	h.logEnabled.Store(true)
+	// Off by default: a line per new flow (every destination) goes to logcat.
+	// SetLogEnabled(true) for debugging.
 	return h
 }
 
@@ -57,15 +57,7 @@ func (h *EngineHook) SetValidator(v UIDValidatorFunc) {
 	h.validator = v
 }
 
-// udpSrcKey returns a cache key containing only the UDP source — used as a secondary
-// cache so that flows from the same socket to different destinations share one IPC call.
-func udpSrcKey(srcIP net.IP, srcPort uint16) ConnectionKey {
-	return ConnectionKey{SrcIP: srcIP.String(), SrcPort: srcPort, Proto: ProtocolUDP}
-}
-
 // Validate checks the cache first; on miss, calls the Kotlin validator.
-// For UDP an additional src-only cache is consulted before the IPC call to avoid
-// per-destination IPC overhead when one app socket reaches many remote endpoints.
 func (h *EngineHook) Validate(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, proto uint8) (bool, int) {
 	key := NewConnectionKey(srcIP, srcPort, dstIP, dstPort, proto)
 
@@ -74,20 +66,6 @@ func (h *EngineHook) Validate(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPor
 			log.Printf("[teapod-tun2socks] cache HIT %s — allowed=%v", key, result.Allowed)
 		}
 		return result.Allowed, result.UID
-	}
-
-	// For UDP, check the src-only cache before calling Kotlin IPC.
-	// One app UDP socket (same srcPort) connects to many remote addresses; the UID
-	// is determined by the socket, not the destination.
-	if proto == ProtocolUDP {
-		sk := udpSrcKey(srcIP, srcPort)
-		if result, ok := h.udpSrcCache.Get(sk); ok {
-			if h.logEnabled.Load() {
-				log.Printf("[teapod-tun2socks] udpSrcCache HIT %s — allowed=%v", key, result.Allowed)
-			}
-			h.cache.Add(key, result)
-			return result.Allowed, result.UID
-		}
 	}
 
 	h.mu.RLock()
@@ -111,18 +89,12 @@ func (h *EngineHook) Validate(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPor
 
 	result := ValidationResult{Allowed: allowed, UID: -1}
 	h.cache.Add(key, result)
-	if proto == ProtocolUDP {
-		h.udpSrcCache.Add(udpSrcKey(srcIP, srcPort), result)
-	}
 	return allowed, -1
 }
 
 // Invalidate removes a connection from the cache.
 func (h *EngineHook) Invalidate(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, proto uint8) {
 	h.cache.Remove(NewConnectionKey(srcIP, srcPort, dstIP, dstPort, proto))
-	if proto == ProtocolUDP {
-		h.udpSrcCache.Remove(udpSrcKey(srcIP, srcPort))
-	}
 }
 
 // CacheLen returns the current full-cache size.

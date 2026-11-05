@@ -3,6 +3,7 @@ package tun2socks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -786,9 +787,14 @@ func pipeConnections(tc *trackedConn, e *Engine) {
 	// when the app sent a request and the upstream never replied (zombie: mid-stream
 	// upstream reset whose close was lost). A one-directional transfer (long download)
 	// keeps the flow alive — the old per-direction deadline killed those at 5 min.
+	//
+	// EOF is a half-close: the FIN is passed on and the other direction keeps
+	// running, so a request followed by shutdown(SHUT_WR) still gets its response.
+	// Closing both ends here lost it. The half-open state is bounded by xray's
+	// uplinkOnly/downlinkOnly policy and by the idle checks above. Any other error
+	// tears the whole flow down.
 	pipe := func(dst, src net.Conn, touched *atomic.Int64) {
 		defer wg.Done()
-		defer shutdown()
 		bufPtr := tcpBufPool.Get().(*[]byte)
 		buf := *bufPtr
 		defer tcpBufPool.Put(bufPtr)
@@ -799,6 +805,7 @@ func pipeConnections(tc *trackedConn, e *Engine) {
 				touched.Store(time.Now().UnixMilli())
 				dst.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
 				if _, werr := dst.Write(buf[:n]); werr != nil {
+					shutdown()
 					return
 				}
 			}
@@ -813,7 +820,12 @@ func pipeConnections(tc *trackedConn, e *Engine) {
 						log.Printf("[teapod-tun2socks] zombie conn to %s closed (request sent, upstream silent %ds)",
 							tc.dst, tcpZombieTimeout.Milliseconds()/1000)
 					}
+				} else if errors.Is(err, io.EOF) {
+					if cw, ok := dst.(interface{ CloseWrite() error }); ok && cw.CloseWrite() == nil {
+						return
+					}
 				}
+				shutdown()
 				return
 			}
 		}
