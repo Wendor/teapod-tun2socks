@@ -24,6 +24,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GO_MODULE_DIR="${SCRIPT_DIR}/go"
 OUTPUT_DIR="${SCRIPT_DIR}/output"
 AAR_NAME="teapod-tun2socks"
+
+# Общая версия проекта — единственный источник: teapodstream/pubspec.yaml
+PUBSPEC="${SCRIPT_DIR}/../teapodstream/pubspec.yaml"
+[ -f "${PUBSPEC}" ] || { echo "ОШИБКА: не найден ${PUBSPEC} (версия берётся из teapodstream)"; exit 1; }
+VERSION=$(awk '/^version:/{split($2,v,"+"); print v[1]; exit}' "${PUBSPEC}")
+[ -n "${VERSION}" ] || { echo "ОШИБКА: не удалось прочитать version из ${PUBSPEC}"; exit 1; }
 MIN_ANDROID_API=29
 
 # Архитектуры для сборки (gomobile targets)
@@ -190,17 +196,14 @@ build_aar() {
         echo ""
         echo "--- Сборка AAR для архитектуры: ${arch} ---"
         # Передаём параметр arch в Gradle
-        ./gradlew assembleFatAar -PtargetArch="${arch}" --no-daemon
+        ./gradlew assembleFatAar -PtargetArch="${arch}" -PlibraryVersion="${VERSION}" --no-daemon
     done
 
     # 3. Копируем результаты в output
     echo ""
     echo "=== Копирование результатов в ${OUTPUT_DIR} ==="
     
-    # Считываем версию из gradle.properties
-    local version
-    version=$(grep "libraryVersion" "${KOTLIN_DIR}/gradle.properties" | cut -d'=' -f2 | tr -d ' \r\n')
-    [ -z "${version}" ] && version="1.0.0"
+    local version="${VERSION}"
 
     # Удаляем временный базовый Go AAR из output
     rm -f "${OUTPUT_DIR}/${AAR_NAME}.aar"
@@ -233,10 +236,7 @@ push_to_github() {
         exit 1
     fi
 
-    # Считываем версию из gradle.properties
-    local version
-    version=$(grep "libraryVersion" "${SCRIPT_DIR}/kotlin/gradle.properties" | cut -d'=' -f2 | tr -d ' \r\n')
-    [ -z "${version}" ] && version="1.0.0"
+    local version="${VERSION}"
     local tag="v${version}"
 
     echo "Версия: ${version}"
@@ -287,10 +287,7 @@ push_to_github() {
 # --- Вывод информации ---
 
 print_info() {
-    # Считываем версию из gradle.properties
-    local version
-    version=$(grep "libraryVersion" "${SCRIPT_DIR}/kotlin/gradle.properties" | cut -d'=' -f2 | tr -d ' \r\n')
-    [ -z "${version}" ] && version="1.0.0"
+    local version="${VERSION}"
 
     echo ""
     echo "=========================================================="

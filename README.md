@@ -121,7 +121,7 @@ export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/<version>
 
 ### 3. Результат
 
-После завершения сборки в директории `output/` будут созданы следующие файлы (где `1.0.0` — текущая версия из `gradle.properties`):
+После завершения сборки в директории `output/` будут созданы следующие файлы (где `1.0.0` — общая версия проекта из `../teapodstream/pubspec.yaml`, передаётся в Gradle как `-PlibraryVersion`):
 - `teapod-tun2socks-arm64-v8a-1.0.0.aar` — AAR для arm64-v8a.
 - `teapod-tun2socks-armeabi-v7a-1.0.0.aar` — AAR для armeabi-v7a.
 - `teapod-tun2socks-x86_64-1.0.0.aar` — AAR для x86_64.
