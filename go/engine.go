@@ -297,9 +297,14 @@ func (e *Engine) tunReadLoop() {
 			// Filter ICMPv4 echo packets when allowICMP is disabled.
 			// ICMP has no source ports, so per-app UID lookup is not possible;
 			// the filter applies to all apps uniformly.
-			if !e.allowICMP && len(pkt) > 9 && pkt[9] == ProtocolICMP {
-				if shouldBlockICMP(pkt, false) {
-					log.Printf("%s ICMPv4 blocked (echo)", e.logPrefix)
+			if len(pkt) > 9 && pkt[9] == ProtocolICMP {
+				if !e.allowICMP {
+					if shouldBlockICMP(pkt, false) {
+						log.Printf("%s ICMPv4 blocked (echo)", e.logPrefix)
+						continue
+					}
+				} else if resp := buildICMPv4EchoReply(pkt); resp != nil {
+					e.writeTun(resp)
 					continue
 				}
 			}
@@ -310,9 +315,7 @@ func (e *Engine) tunReadLoop() {
 			if e.blockQuic && isUDPDstPortIPv4(pkt, 443) {
 				e.quicRejects.Add(1)
 				if resp := buildICMPv4PortUnreachable(pkt); resp != nil {
-					if _, werr := e.tunFile.Write(resp); werr != nil && e.running.Load() {
-						log.Printf("%s ICMPv4 unreachable write failed: %v", e.logPrefix, werr)
-					}
+					e.writeTun(resp)
 				}
 				continue
 			}
@@ -321,18 +324,21 @@ func (e *Engine) tunReadLoop() {
 			// Filter ICMPv6 echo packets when allowICMP is disabled. Walk the
 			// extension header chain so an echo hidden behind e.g. a Hop-by-Hop
 			// header cannot slip past the filter.
-			if !e.allowICMP {
-				if hdrProto, off, hok := ipv6TransportHeader(pkt); hok && hdrProto == ProtocolICMPv6 && shouldBlockICMPv6(pkt, off) {
-					log.Printf("%s ICMPv6 blocked (echo)", e.logPrefix)
+			if hdrProto, off, hok := ipv6TransportHeader(pkt); hok && hdrProto == ProtocolICMPv6 {
+				if !e.allowICMP {
+					if shouldBlockICMPv6(pkt, off) {
+						log.Printf("%s ICMPv6 blocked (echo)", e.logPrefix)
+						continue
+					}
+				} else if resp := buildICMPv6EchoReply(pkt, off); resp != nil {
+					e.writeTun(resp)
 					continue
 				}
 			}
 			if e.blockQuic && isUDPDstPortIPv6(pkt, 443) {
 				e.quicRejects.Add(1)
 				if resp := buildICMPv6PortUnreachable(pkt); resp != nil {
-					if _, werr := e.tunFile.Write(resp); werr != nil && e.running.Load() {
-						log.Printf("%s ICMPv6 unreachable write failed: %v", e.logPrefix, werr)
-					}
+					e.writeTun(resp)
 				}
 				continue
 			}
@@ -345,6 +351,13 @@ func (e *Engine) tunReadLoop() {
 		})
 		e.endpoint.InjectInbound(proto, pkb)
 		pkb.DecRef()
+	}
+}
+
+// writeTun writes a locally generated reply (ICMP unreachable / echo reply) to the TUN.
+func (e *Engine) writeTun(pkt []byte) {
+	if _, err := e.tunFile.Write(pkt); err != nil && e.running.Load() {
+		log.Printf("%s TUN reply write failed: %v", e.logPrefix, err)
 	}
 }
 

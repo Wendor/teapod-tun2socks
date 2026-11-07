@@ -81,30 +81,73 @@ func buildICMPv6PortUnreachable(pkt []byte) []byte {
 	copy(out[8:24], pkt[24:40])  // src = orig dst
 	copy(out[24:40], pkt[8:24])  // dst = orig src
 
-	// ICMPv6 checksum spans a pseudo-header (src + dst + length + next-header) followed
-	// by the ICMPv6 message itself.
-	var sum uint32
-	for i := 0; i < 16; i += 2 {
-		sum += uint32(out[8+i])<<8 | uint32(out[8+i+1])
-	}
-	for i := 0; i < 16; i += 2 {
-		sum += uint32(out[24+i])<<8 | uint32(out[24+i+1])
-	}
-	sum += uint32(icmpLen)
-	sum += uint32(ProtocolICMPv6)
-	for i := 0; i+1 < icmpLen; i += 2 {
-		sum += uint32(icmp[i])<<8 | uint32(icmp[i+1])
-	}
-	if icmpLen%2 == 1 {
-		sum += uint32(icmp[icmpLen-1]) << 8
-	}
-	for sum>>16 != 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	binary.BigEndian.PutUint16(icmp[2:4], ^uint16(sum))
+	binary.BigEndian.PutUint16(icmp[2:4], icmpv6Checksum(out[8:24], out[24:40], icmp))
 
 	copy(out[40:], icmp)
 	return out
+}
+
+// buildICMPv4EchoReply answers an ICMPv4 Echo Request locally (allowICMP): SOCKS5
+// cannot carry ICMP, so the reply comes from the TUN itself, as in xray-rust.
+// The reply mirrors the request (IP options and payload kept) with swapped
+// addresses and type 0. Returns nil for anything but an unfragmented Echo Request.
+func buildICMPv4EchoReply(pkt []byte) []byte {
+	if len(pkt) < 20 || pkt[9] != ProtocolICMP {
+		return nil
+	}
+	ihl := int(pkt[0]&0x0F) * 4
+	total := int(binary.BigEndian.Uint16(pkt[2:4]))
+	if ihl < 20 || total < ihl+8 || total > len(pkt) || pkt[ihl] != 8 ||
+		binary.BigEndian.Uint16(pkt[6:8])&0x3FFF != 0 { // MF flag or fragment offset
+		return nil
+	}
+	out := make([]byte, total)
+	copy(out, pkt[:total])
+	copy(out[12:16], pkt[16:20])
+	copy(out[16:20], pkt[12:16])
+	out[8] = 64
+	out[10], out[11] = 0, 0
+	binary.BigEndian.PutUint16(out[10:12], internetChecksum(out[:ihl]))
+	icmp := out[ihl:]
+	icmp[0] = 0
+	icmp[2], icmp[3] = 0, 0
+	binary.BigEndian.PutUint16(icmp[2:4], internetChecksum(icmp))
+	return out
+}
+
+// buildICMPv6EchoReply is the ICMPv6 counterpart (type 128 → 129). Extension
+// headers of the request are dropped: the reply carries only the base header.
+// off is the ICMPv6 offset from ipv6TransportHeader.
+func buildICMPv6EchoReply(pkt []byte, off int) []byte {
+	end := 40 + int(binary.BigEndian.Uint16(pkt[4:6]))
+	if len(pkt) < 40 || end > len(pkt) || end < off+8 || pkt[off] != 128 {
+		return nil
+	}
+	icmpLen := end - off
+	out := make([]byte, 40+icmpLen)
+	out[0] = 0x60
+	binary.BigEndian.PutUint16(out[4:6], uint16(icmpLen))
+	out[6] = ProtocolICMPv6
+	out[7] = 64
+	copy(out[8:24], pkt[24:40])
+	copy(out[24:40], pkt[8:24])
+	icmp := out[40:]
+	copy(icmp, pkt[off:end])
+	icmp[0] = 129
+	icmp[2], icmp[3] = 0, 0
+	binary.BigEndian.PutUint16(icmp[2:4], icmpv6Checksum(out[8:24], out[24:40], icmp))
+	return out
+}
+
+// icmpv6Checksum: RFC 4443 checksum over the pseudo-header (src, dst, length,
+// next header) and the ICMPv6 message, whose checksum field must be zero.
+func icmpv6Checksum(src, dst, msg []byte) uint16 {
+	pseudo := make([]byte, 0, 40+len(msg))
+	pseudo = append(pseudo, src...)
+	pseudo = append(pseudo, dst...)
+	pseudo = binary.BigEndian.AppendUint32(pseudo, uint32(len(msg)))
+	pseudo = append(pseudo, 0, 0, 0, ProtocolICMPv6)
+	return internetChecksum(append(pseudo, msg...))
 }
 
 // internetChecksum computes the standard 16-bit one's-complement Internet checksum
