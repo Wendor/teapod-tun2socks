@@ -1,5 +1,7 @@
 # teapod-tun2socks — Strict AAR Library
 
+> **Archived.** The code now lives in [Wendor/teapod-stream](https://github.com/Wendor/teapod-stream) under [`core/tun2socks/`](https://github.com/Wendor/teapod-stream/tree/master/core/tun2socks). Its full history is kept there; old releases here stay available. Issues and pull requests: in teapod-stream.
+
 [Русский](README.md) | **English**
 
 An Android AAR library that works as a strict split-tunneling VPN gateway. It takes the TUN interface FileDescriptor, turns raw IP packets into TCP/UDP sessions with a userspace TCP/IP stack (gvisor/netstack in Go), and strictly checks the process UID before forwarding traffic to a SOCKS5 proxy.
